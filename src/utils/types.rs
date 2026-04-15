@@ -1,11 +1,16 @@
+use dioxus::core::Task;
+use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AppView {
     NewChat,
     ChatMode(ChatMode),
     Settings,
 }
-
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,4 +78,46 @@ pub struct ChatSession {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct InputSettings {
     pub ctrl_enter_submit: bool, // true = Ctrl+Enter to submit, false = Enter to submit
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum RunStatus {
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveRunRecord {
+    pub id: String,
+    pub session_id: Option<String>,
+    pub mode: ChatMode,
+    pub label: String,
+    pub status: RunStatus,
+    pub started_at: String,
+    pub task: Task,
+    pub cancel_flag: Arc<AtomicBool>,
+}
+
+impl ActiveRunRecord {
+    pub fn request_cancel(&self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
+    }
+}
+
+impl PartialEq for ActiveRunRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.session_id == other.session_id
+            && self.mode == other.mode
+            && self.label == other.label
+            && self.status == other.status
+            && self.started_at == other.started_at
+    }
 }

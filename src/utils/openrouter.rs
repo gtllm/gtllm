@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // ============================================================================
 // Constants
@@ -213,6 +214,23 @@ pub struct ModelStreamEvent {
 pub struct OpenRouterClient {
     client: Client,
     api_key: Arc<String>,
+    concurrency_limit: Arc<Semaphore>,
+}
+
+struct LimitedStream {
+    inner: Pin<Box<dyn Stream<Item = StreamEvent> + Send>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for LimitedStream {
+    type Item = StreamEvent;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
 }
 
 impl PartialEq for OpenRouterClient {
@@ -233,6 +251,7 @@ impl OpenRouterClient {
         Ok(Self {
             client,
             api_key: Arc::new(api_key),
+            concurrency_limit: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -345,6 +364,13 @@ impl OpenRouterClient {
         model_id: String,
         messages: Vec<ChatMessage>,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamEvent> + Send>>, String> {
+        let permit = self
+            .concurrency_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| format!("Failed to acquire concurrency permit: {}", e))?;
+
         let request = ChatCompletionRequest {
             model: model_id,
             messages,
@@ -428,7 +454,10 @@ impl OpenRouterClient {
             },
         );
 
-        Ok(Box::pin(stream))
+        Ok(Box::pin(LimitedStream {
+            inner: Box::pin(stream),
+            _permit: permit,
+        }))
     }
 
     // ========================================================================

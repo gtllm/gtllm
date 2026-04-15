@@ -1,4 +1,7 @@
 use dioxus::prelude::*;
+use dioxus::core::spawn_forever;
+#[cfg(feature = "desktop")]
+use dioxus::desktop::{use_window, use_wry_event_handler, WindowCloseBehaviour, WindowEvent};
 
 mod components;
 mod utils;
@@ -6,17 +9,112 @@ mod utils;
 use components::{
     Choice, Collaborative, Competitive, Header, NewChat, PvP, Settings as SettingsView, Sidebar, Standard,
 };
-use utils::{AppView, ArenaMessage, ChatHistory, ChatMode, ChatSession, InputSettings, Message, OpenRouterClient, Settings, Theme};
+use utils::{ActiveRunRecord, AppView, ArenaMessage, ChatHistory, ChatMode, ChatSession, InputSettings, Message, OpenRouterClient, RunStatus, Settings, Theme};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 fn main() {
+    #[cfg(feature = "desktop")]
+    {
+        let config = if cfg!(debug_assertions) {
+            dioxus::desktop::Config::new().with_close_behaviour(WindowCloseBehaviour::WindowHides)
+        } else {
+            dioxus::desktop::Config::new()
+                .with_menu(None)
+                .with_close_behaviour(WindowCloseBehaviour::WindowHides)
+        };
+
+        dioxus::LaunchBuilder::desktop()
+            .with_cfg(config)
+            .launch(App);
+    }
+
+    #[cfg(not(feature = "desktop"))]
     dioxus::launch(App);
 }
 
 #[component]
 fn App() -> Element {
+    let active_runs = use_signal(HashMap::<String, ActiveRunRecord>::new);
+    use_context_provider(|| active_runs);
+
+    #[cfg(feature = "desktop")]
+    {
+        let window = use_window();
+        let mut shutdown_requested = use_signal(|| false);
+        let mut active_runs_for_close = active_runs.clone();
+        let window_for_close = window.clone();
+
+        use_wry_event_handler(move |event, _| {
+            if let dioxus::desktop::tao::event::Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } = event
+            {
+                if shutdown_requested() {
+                    return;
+                }
+
+                let active_ids: Vec<String> = active_runs_for_close
+                    .read()
+                    .iter()
+                    .filter(|(_, run)| matches!(run.status, RunStatus::Running | RunStatus::Cancelling))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+
+                if active_ids.is_empty() {
+                    window_for_close.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+                    window_for_close.close();
+                    return;
+                }
+
+                shutdown_requested.set(true);
+
+                {
+                    let mut runs = active_runs_for_close.write();
+                    for run_id in &active_ids {
+                        if let Some(run) = runs.get_mut(run_id) {
+                            run.request_cancel();
+                            run.status = RunStatus::Cancelling;
+                        }
+                    }
+                }
+
+                let mut active_runs_for_shutdown = active_runs_for_close.clone();
+                let window_for_shutdown = window_for_close.clone();
+                spawn_forever(async move {
+                    let deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(3);
+
+                    loop {
+                        let active_left = active_runs_for_shutdown
+                            .read()
+                            .values()
+                            .any(|run| matches!(run.status, RunStatus::Running | RunStatus::Cancelling));
+                        if !active_left || tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+
+                    {
+                        let runs = active_runs_for_shutdown.read();
+                        for run in runs.values() {
+                            if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+                                run.task.cancel();
+                            }
+                        }
+                    }
+
+                    window_for_shutdown.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+                    window_for_shutdown.close();
+                });
+            }
+        });
+    }
+
     // Load settings from disk on startup
     let mut app_settings = use_signal(|| {
         Settings::load().unwrap_or_else(|e| {

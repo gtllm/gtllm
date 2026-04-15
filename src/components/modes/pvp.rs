@@ -1,9 +1,18 @@
 use super::common::{ChatInput, FormattedText, Modal};
-use crate::utils::{ChatMessage, ChatHistory, ChatMode, ChatSession, InputSettings, Model, OpenRouterClient, PvPHistory, SessionData, StreamEvent, Theme};
+use crate::utils::{
+    create_run_id, find_run_for_session, next_stream_event_with_cancel, recv_multi_event_with_cancel,
+    register_active_run, remove_run, set_run_status, try_signal_read, try_signal_set,
+    try_signal_update, ActiveRunRecord, ChatMessage, ChatHistory, ChatMode, ChatSession,
+    InputSettings, Model, OpenRouterClient, PvPHistory, RunStatus, SessionData, StreamEvent,
+    Theme,
+};
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use futures::stream::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 struct SystemPrompts {
@@ -71,6 +80,7 @@ pub fn PvP(props: PvPProps) -> Element {
     let client_for_send = props.client;
     let input_settings = props.input_settings;
     let _ = theme.read();
+    let active_runs = use_context::<Signal<HashMap<String, ActiveRunRecord>>>();
 
     // Model selection state
     let mut bot_models = use_signal(|| Vec::<String>::new());
@@ -87,6 +97,7 @@ pub fn PvP(props: PvPProps) -> Element {
     let mut is_streaming_moderator = use_signal(|| false);
     let mut current_bot_responses = use_signal(|| HashMap::<String, String>::new());
     let mut current_moderator_response = use_signal(|| String::new());
+    let mut current_run_id = use_signal(|| None::<String>);
     
     // System prompts
     let mut system_prompts = use_signal(SystemPrompts::default);
@@ -94,60 +105,71 @@ pub fn PvP(props: PvPProps) -> Element {
     let mut editing_prompt_target = use_signal(|| PromptEditTarget::Bot);
     let mut temp_prompt = use_signal(String::new);
     
-    // Track the currently loaded session to avoid reloading on every render
     let mut loaded_session_id = use_signal(|| None::<String>);
-    
-    // Load history if session_id changes (not on every render)
     let session_id = props.session_id.clone();
-    let should_load = session_id != *loaded_session_id.read();
-    
-    if should_load {
-        loaded_session_id.set(session_id.clone());
-        
-        if let Some(sid) = session_id.clone() {
-            match ChatHistory::load_session(&sid) {
+    let session_loader = use_resource(move || {
+        let session_id = session_id.clone();
+        async move {
+            if let Some(sid) = session_id {
+                let result = tokio::task::spawn_blocking(move || ChatHistory::load_session(&sid)).await;
+                match result {
+                    Ok(Ok(session_data)) => Some(Ok(session_data)),
+                    Ok(Err(e)) => Some(Err(e)),
+                    Err(e) => Some(Err(format!("Task join error: {}", e))),
+                }
+            } else {
+                None
+            }
+        }
+    });
+
+    if let Some(Some(result)) = session_loader.read().as_ref() {
+        let current_sid = props.session_id.clone();
+        if current_sid != *loaded_session_id.read() {
+            match result {
                 Ok(session_data) => {
-                    if let ChatHistory::PvP(history) = session_data.history {
+                    if let ChatHistory::PvP(history) = &session_data.history {
+                        loaded_session_id.set(current_sid.clone());
                         let bot_models_clone = history.bot_models.clone();
                         let moderator_model_clone = history.moderator_model.clone();
                         bot_models.set(bot_models_clone.clone());
                         moderator_model.set(moderator_model_clone.clone());
                         system_prompts.set(SystemPrompts {
-                            bot: history.system_prompts.bot,
-                            moderator: history.system_prompts.moderator,
+                            bot: history.system_prompts.bot.clone(),
+                            moderator: history.system_prompts.moderator.clone(),
                         });
-                        
-                        // Convert rounds from history to internal format
-                        let converted_rounds: Vec<ConversationRound> = history.rounds
-                            .into_iter()
+
+                        let converted_rounds: Vec<ConversationRound> = history
+                            .rounds
+                            .iter()
                             .map(|r| ConversationRound {
-                                user_message: r.user_message,
+                                user_message: r.user_message.clone(),
                                 bot1_response: BotResponse {
-                                    model_id: r.bot1_response.model_id,
-                                    content: r.bot1_response.content,
-                                    error_message: r.bot1_response.error_message,
+                                    model_id: r.bot1_response.model_id.clone(),
+                                    content: r.bot1_response.content.clone(),
+                                    error_message: r.bot1_response.error_message.clone(),
                                 },
                                 bot2_response: BotResponse {
-                                    model_id: r.bot2_response.model_id,
-                                    content: r.bot2_response.content,
-                                    error_message: r.bot2_response.error_message,
+                                    model_id: r.bot2_response.model_id.clone(),
+                                    content: r.bot2_response.content.clone(),
+                                    error_message: r.bot2_response.error_message.clone(),
                                 },
-                                moderator_judgment: r.moderator_judgment.map(|m| ModeratorResponse {
-                                    content: m.content,
-                                    error_message: m.error_message,
+                                moderator_judgment: r.moderator_judgment.as_ref().map(|m| ModeratorResponse {
+                                    content: m.content.clone(),
+                                    error_message: m.error_message.clone(),
                                 }),
                             })
                             .collect();
                         conversation_history.set(converted_rounds);
-                        
-                        // Only enter chat if configuration is complete.
+
                         if bot_models_clone.len() == 2 && moderator_model_clone.is_some() {
                             selection_step.set(2);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load session {}: {}", sid, e);
+                    eprintln!("Failed to load session: {}", e);
+                    loaded_session_id.set(current_sid);
                     bot_models.set(Vec::new());
                     moderator_model.set(None);
                     conversation_history.set(Vec::new());
@@ -155,14 +177,14 @@ pub fn PvP(props: PvPProps) -> Element {
                     selection_step.set(0);
                 }
             }
-        } else {
-            // New session - reset state
-            bot_models.set(Vec::new());
-            moderator_model.set(None);
-            conversation_history.set(Vec::new());
-            system_prompts.set(SystemPrompts::default());
-            selection_step.set(0);
         }
+    } else if props.session_id.is_none() && loaded_session_id.read().is_some() {
+        loaded_session_id.set(None);
+        bot_models.set(Vec::new());
+        moderator_model.set(None);
+        conversation_history.set(Vec::new());
+        system_prompts.set(SystemPrompts::default());
+        selection_step.set(0);
     }
 
     // Fetch models on component mount
@@ -238,9 +260,28 @@ pub fn PvP(props: PvPProps) -> Element {
         prompt_editor_open.set(false);
     };
 
+    let active_run_for_session = find_run_for_session(active_runs, &props.session_id, ChatMode::PvP);
+    let run_is_active = active_run_for_session.as_ref().is_some_and(|run| {
+        matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+    });
+    let cancel_bar_run = active_run_for_session.as_ref().and_then(|run| {
+        if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+            Some((run.id.clone(), matches!(run.status, RunStatus::Cancelling)))
+        } else {
+            None
+        }
+    });
+    if let Some(active_run) = &active_run_for_session {
+        if current_run_id.read().as_ref() != Some(&active_run.id) {
+            current_run_id.set(Some(active_run.id.clone()));
+        }
+    } else if current_run_id.read().is_some() {
+        current_run_id.set(None);
+    }
+
     // Send message handler
     let send_message = move |text: String| {
-        if text.trim().is_empty() || *is_streaming_bots.read() || *is_streaming_moderator.read() {
+        if text.trim().is_empty() || *is_streaming_bots.read() || *is_streaming_moderator.read() || run_is_active {
             return;
         }
 
@@ -269,6 +310,9 @@ pub fn PvP(props: PvPProps) -> Element {
             let bot_models_for_save = bot_models.read().clone();
             let moderator_model_for_save = moderator_model.read().clone();
             let system_prompts_for_save = system_prompts.read().clone();
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let run_id = create_run_id(ChatMode::PvP, &props.session_id);
+            current_run_id.set(Some(run_id.clone()));
 
             // Immediately add the user message and empty bot responses to show in UI
             conversation_history_clone.write().push(ConversationRound {
@@ -286,9 +330,12 @@ pub fn PvP(props: PvPProps) -> Element {
                 moderator_judgment: None,
             });
 
-            spawn(async move {
-                is_streaming_bots_clone.set(true);
-                current_bot_responses_clone.write().clear();
+            let run_id_for_task = run_id.clone();
+            let mut active_runs_for_task = active_runs.clone();
+            let cancel_flag_for_task = cancel_flag.clone();
+            let task = spawn_forever(async move {
+                try_signal_set(&mut is_streaming_bots_clone, true);
+                let _ = try_signal_update(&mut current_bot_responses_clone, |responses| responses.clear());
 
                 // Send to both bots in parallel with system prompt
                 let messages = vec![
@@ -306,7 +353,10 @@ pub fn PvP(props: PvPProps) -> Element {
                         let mut last_update = std::time::Instant::now();
                         const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                        while let Some(event) = rx.recv().await {
+                        while let Some(event) = recv_multi_event_with_cancel(&mut rx, &cancel_flag_for_task).await {
+                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let model_id = event.model_id.clone();
 
                             match event.event {
@@ -321,9 +371,9 @@ pub fn PvP(props: PvPProps) -> Element {
                                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
                                         // Flush only the active model to reduce cloning work.
                                         if let Some(accumulated) = content_buffer.get(&model_id) {
-                                            current_bot_responses_clone
-                                                .write()
-                                                .insert(model_id.clone(), accumulated.clone());
+                                            let _ = try_signal_update(&mut current_bot_responses_clone, |responses| {
+                                                responses.insert(model_id.clone(), accumulated.clone());
+                                            });
                                         }
                                         
                                         last_update = std::time::Instant::now();
@@ -332,56 +382,69 @@ pub fn PvP(props: PvPProps) -> Element {
                                 StreamEvent::Done => {
                                     // Flush any remaining buffered content before marking done
                                     if let Some(accumulated) = content_buffer.remove(&model_id) {
-                                        let mut responses = current_bot_responses_clone.write();
-                                        responses.insert(model_id.clone(), accumulated);
+                                        let _ = try_signal_update(&mut current_bot_responses_clone, |responses| {
+                                            responses.insert(model_id.clone(), accumulated);
+                                        });
                                     }
                                     
                                     done_bots.insert(model_id);
 
                                     // Check if both bots are done
                                     if done_bots.len() >= 2 {
-                                        is_streaming_bots_clone.set(false);
+                                        try_signal_set(&mut is_streaming_bots_clone, false);
 
                                         // Get final bot responses
-                                        let (bot1_final, bot1_error, bot2_final, bot2_error) = {
-                                            let responses = current_bot_responses_clone.read();
-                                            let bot1_content = responses.get(&bot1_id).cloned().unwrap_or_default();
-                                            let bot2_content = responses.get(&bot2_id).cloned().unwrap_or_default();
+                                        let (bot1_final, bot1_error, bot2_final, bot2_error) = try_signal_read(
+                                            &current_bot_responses_clone,
+                                            |responses| {
+                                                let bot1_content = responses.get(&bot1_id).cloned().unwrap_or_default();
+                                                let bot2_content = responses.get(&bot2_id).cloned().unwrap_or_default();
 
-                                            // Check for errors
-                                            let (bot1_final, bot1_error) = if bot1_content.starts_with("Error: ") {
-                                                (String::new(), Some(bot1_content.strip_prefix("Error: ").unwrap_or(&bot1_content).to_string()))
-                                            } else {
-                                                (bot1_content, None)
-                                            };
+                                                // Check for errors
+                                                let (bot1_final, bot1_error) = if bot1_content.starts_with("Error: ") {
+                                                    (String::new(), Some(bot1_content.strip_prefix("Error: ").unwrap_or(&bot1_content).to_string()))
+                                                } else {
+                                                    (bot1_content, None)
+                                                };
 
-                                            let (bot2_final, bot2_error) = if bot2_content.starts_with("Error: ") {
-                                                (String::new(), Some(bot2_content.strip_prefix("Error: ").unwrap_or(&bot2_content).to_string()))
-                                            } else {
-                                                (bot2_content, None)
-                                            };
+                                                let (bot2_final, bot2_error) = if bot2_content.starts_with("Error: ") {
+                                                    (String::new(), Some(bot2_content.strip_prefix("Error: ").unwrap_or(&bot2_content).to_string()))
+                                                } else {
+                                                    (bot2_content, None)
+                                                };
 
-                                            (bot1_final, bot1_error, bot2_final, bot2_error)
-                                        };
+                                                (bot1_final, bot1_error, bot2_final, bot2_error)
+                                            },
+                                        )
+                                        .unwrap_or_else(|| {
+                                            (
+                                                String::new(),
+                                                Some("Background view was closed".to_string()),
+                                                String::new(),
+                                                Some("Background view was closed".to_string()),
+                                            )
+                                        });
 
                                         // Update the last conversation round with bot responses
-                                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                            last_round.bot1_response = BotResponse {
-                                                model_id: bot1_id.clone(),
-                                                content: bot1_final.clone(),
-                                                error_message: bot1_error.clone(),
-                                            };
-                                            last_round.bot2_response = BotResponse {
-                                                model_id: bot2_id.clone(),
-                                                content: bot2_final.clone(),
-                                                error_message: bot2_error.clone(),
-                                            };
-                                        }
+                                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                            if let Some(last_round) = history.last_mut() {
+                                                last_round.bot1_response = BotResponse {
+                                                    model_id: bot1_id.clone(),
+                                                    content: bot1_final.clone(),
+                                                    error_message: bot1_error.clone(),
+                                                };
+                                                last_round.bot2_response = BotResponse {
+                                                    model_id: bot2_id.clone(),
+                                                    content: bot2_final.clone(),
+                                                    error_message: bot2_error.clone(),
+                                                };
+                                            }
+                                        });
 
                                         // Now send to moderator if both bots succeeded
                                         if bot1_error.is_none() && bot2_error.is_none() {
-                                            is_streaming_moderator_clone.set(true);
-                                            current_moderator_response_clone.set(String::new());
+                                            try_signal_set(&mut is_streaming_moderator_clone, true);
+                                            try_signal_set(&mut current_moderator_response_clone, String::new());
 
                                             let moderator_prompt = format!(
                                                 "User Question: {}\n\n\
@@ -406,36 +469,43 @@ pub fn PvP(props: PvPProps) -> Element {
                                                     let mut last_update = std::time::Instant::now();
                                                     const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                                                    while let Some(event) = stream.next().await {
+                                                    while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_task).await {
+                                                        if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                                            break;
+                                                        }
                                                         match event {
                                                             StreamEvent::Content(content) => {
                                                                 mod_content.push_str(&content);
                                                                 
                                                                 // Throttle updates: only write to signal every 16ms
                                                                 if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                                                    current_moderator_response_clone.set(mod_content.clone());
+                                                                    try_signal_set(&mut current_moderator_response_clone, mod_content.clone());
                                                                     
                                                                     last_update = std::time::Instant::now();
                                                                 }
                                                             }
                                                             StreamEvent::Done => {
                                                                 // Flush final content
-                                                                current_moderator_response_clone.set(mod_content.clone());
+                                                                try_signal_set(&mut current_moderator_response_clone, mod_content.clone());
                                                                 
                                                                 // Update the last conversation round with moderator response
-                                                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                                                    last_round.moderator_judgment = Some(ModeratorResponse {
-                                                                        content: mod_content.clone(),
-                                                                        error_message: None,
-                                                                    });
-                                                                }
-                                                                current_moderator_response_clone.set(String::new());
-                                                                is_streaming_moderator_clone.set(false);
+                                                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                                                    if let Some(last_round) = history.last_mut() {
+                                                                        last_round.moderator_judgment = Some(ModeratorResponse {
+                                                                            content: mod_content.clone(),
+                                                                            error_message: None,
+                                                                        });
+                                                                    }
+                                                                });
+                                                                try_signal_set(&mut current_moderator_response_clone, String::new());
+                                                                try_signal_set(&mut is_streaming_moderator_clone, false);
                                                                 
                                                                 // Auto-save only when there is content (spawn_blocking to avoid blocking async runtime)
                                                                 if let Some(sid) = session_id_for_save {
                                                                     let history = PvPHistory {
-                                                                        rounds: conversation_history_clone.read().iter()
+                                                                        rounds: try_signal_read(&conversation_history_clone, |history| history.clone())
+                                                                            .unwrap_or_default()
+                                                                            .iter()
                                                                             .map(|r| crate::utils::ConversationRound {
                                                                                 user_message: r.user_message.clone(),
                                                                                 bot1_response: crate::utils::BotResponse {
@@ -488,64 +558,111 @@ pub fn PvP(props: PvPProps) -> Element {
                                                                 break;
                                                             }
                                                             StreamEvent::Error(e) => {
-                                                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                                                    last_round.moderator_judgment = Some(ModeratorResponse {
-                                                                        content: String::new(),
-                                                                        error_message: Some(e.clone()),
-                                                                    });
+                                                                if e == "Cancelled" {
+                                                                    break;
                                                                 }
-                                                                current_moderator_response_clone.set(String::new());
-                                                                is_streaming_moderator_clone.set(false);
+                                                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                                                    if let Some(last_round) = history.last_mut() {
+                                                                        last_round.moderator_judgment = Some(ModeratorResponse {
+                                                                            content: String::new(),
+                                                                            error_message: Some(e.clone()),
+                                                                        });
+                                                                    }
+                                                                });
+                                                                try_signal_set(&mut current_moderator_response_clone, String::new());
+                                                                try_signal_set(&mut is_streaming_moderator_clone, false);
                                                                 break;
                                                             }
                                                         }
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                                        last_round.moderator_judgment = Some(ModeratorResponse {
-                                                            content: String::new(),
-                                                            error_message: Some(e),
-                                                        });
-                                                    }
-                                                    is_streaming_moderator_clone.set(false);
+                                                    let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                                        if let Some(last_round) = history.last_mut() {
+                                                            last_round.moderator_judgment = Some(ModeratorResponse {
+                                                                content: String::new(),
+                                                                error_message: Some(e),
+                                                            });
+                                                        }
+                                                    });
+                                                    try_signal_set(&mut is_streaming_moderator_clone, false);
                                                 }
                                             }
                                         } else {
                                             // If either bot had an error, don't call moderator
-                                            current_bot_responses_clone.write().clear();
+                                            let _ = try_signal_update(&mut current_bot_responses_clone, |responses| {
+                                                responses.clear()
+                                            });
                                         }
 
                                         break;
                                     }
                                 }
                                 StreamEvent::Error(e) => {
-                                    let mut responses = current_bot_responses_clone.write();
-                                    responses.insert(model_id.clone(), format!("Error: {}", e));
+                                    if e == "Cancelled" {
+                                        break;
+                                    }
+                                    let _ = try_signal_update(&mut current_bot_responses_clone, |responses| {
+                                        responses.insert(model_id.clone(), format!("Error: {}", e));
+                                    });
                                     done_bots.insert(model_id);
+                                    if done_bots.len() >= 2 {
+                                        try_signal_set(&mut is_streaming_bots_clone, false);
+                                    }
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        is_streaming_bots_clone.set(false);
+                        try_signal_set(&mut is_streaming_bots_clone, false);
 
                         // Update the last conversation round with error responses
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.bot1_response = BotResponse {
-                                model_id: bot1_id,
-                                content: String::new(),
-                                error_message: Some(e.clone()),
-                            };
-                            last_round.bot2_response = BotResponse {
-                                model_id: bot2_id,
-                                content: String::new(),
-                                error_message: Some(e),
-                            };
-                        }
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.bot1_response = BotResponse {
+                                    model_id: bot1_id,
+                                    content: String::new(),
+                                    error_message: Some(e.clone()),
+                                };
+                                last_round.bot2_response = BotResponse {
+                                    model_id: bot2_id,
+                                    content: String::new(),
+                                    error_message: Some(e),
+                                };
+                            }
+                        });
                     }
                 }
+
+                if cancel_flag_for_task.load(Ordering::SeqCst) {
+                    try_signal_set(&mut is_streaming_bots_clone, false);
+                    try_signal_set(&mut is_streaming_moderator_clone, false);
+                    try_signal_set(&mut current_moderator_response_clone, String::new());
+                    let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                        if let Some(last_round) = history.last_mut() {
+                            if last_round.moderator_judgment.is_none() {
+                                last_round.moderator_judgment = Some(ModeratorResponse {
+                                    content: String::new(),
+                                    error_message: Some("Cancelled".to_string()),
+                                });
+                            }
+                        }
+                    });
+                    set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                } else {
+                    remove_run(active_runs_for_task, &run_id_for_task);
+                }
             });
+
+            register_active_run(
+                active_runs,
+                run_id,
+                props.session_id.clone(),
+                ChatMode::PvP,
+                "PvP round".to_string(),
+                task,
+                cancel_flag,
+            );
         }
     };
 
@@ -1105,6 +1222,35 @@ pub fn PvP(props: PvPProps) -> Element {
                             }
                         }
                     }
+                }
+
+                if let Some((active_run_id, is_cancelling)) = cancel_bar_run.clone() {
+                        div {
+                            class: "px-4 py-3 border-t border-[var(--color-base-300)] bg-[var(--color-base-100)] flex items-center justify-between gap-3",
+                            div {
+                                class: "text-sm text-[var(--color-base-content)]/70",
+                                if is_cancelling {
+                                    "Cancelling active PvP run..."
+                                } else {
+                                    "Active PvP run is still processing. You can leave this chat open or cancel it manually."
+                                }
+                            }
+                            button {
+                                onclick: move |_| {
+                                    if let Some(run) = active_runs.read().get(&active_run_id).cloned() {
+                                        run.request_cancel();
+                                        set_run_status(active_runs, &active_run_id, RunStatus::Cancelling);
+                                    }
+                                },
+                                disabled: is_cancelling,
+                                class: "px-3 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-500/90 disabled:opacity-60 disabled:cursor-not-allowed",
+                                if is_cancelling {
+                                    "Cancelling..."
+                                } else {
+                                    "Cancel Run"
+                                }
+                            }
+                        }
                 }
 
                 // Input area

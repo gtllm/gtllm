@@ -1,11 +1,18 @@
 use super::common::{ChatInput, FormattedText, PromptCard, PromptEditorModal, PromptType};
 use crate::utils::{
-    ChatHistory, ChatMessage, ChatMode, ChatSession, InputSettings, Model, OpenRouterClient, SessionData, StreamEvent, Theme,
+    create_run_id, find_run_for_session, next_stream_event_with_cancel,
+    recv_multi_event_with_cancel, register_active_run, remove_run, set_run_status,
+    try_signal_read, try_signal_set, try_signal_update, ActiveRunRecord, ChatHistory,
+    ChatMessage, ChatMode, ChatSession, InputSettings, Model, OpenRouterClient, RunStatus,
+    SessionData, StreamEvent, Theme,
 };
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use futures::stream::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 // ============================================================================
 // Data Structures
@@ -123,6 +130,7 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
     let client = props.client.clone();
     let client_for_send = props.client;
     let input_settings = props.input_settings;
+    let active_runs = use_context::<Signal<HashMap<String, ActiveRunRecord>>>();
     let _ = theme.read();
 
     // Prompt templates
@@ -142,43 +150,53 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
     // Chat state
     let mut conversation_history = use_signal(|| Vec::<CollaborativeRound>::new());
     let current_phase = use_signal(|| CollaborativePhase::Initial);
-    let is_processing = use_signal(|| false);
+    let mut is_processing = use_signal(|| false);
     let current_streaming_responses = use_signal(|| HashMap::<String, String>::new());
+    let mut current_run_id = use_signal(|| None::<String>);
 
-    // Track the currently loaded session to avoid reloading on every render
     let mut loaded_session_id = use_signal(|| None::<String>);
-    
-    // Load history if session_id changes (not on every render)
     let session_id = props.session_id.clone();
-    let should_load = session_id != *loaded_session_id.read();
-    
-    if should_load {
-        loaded_session_id.set(session_id.clone());
-        
-        if let Some(sid) = session_id.clone() {
-            match ChatHistory::load_session(&sid) {
+    let session_loader = use_resource(move || {
+        let session_id = session_id.clone();
+        async move {
+            if let Some(sid) = session_id {
+                let result = tokio::task::spawn_blocking(move || ChatHistory::load_session(&sid)).await;
+                match result {
+                    Ok(Ok(session_data)) => Some(Ok(session_data)),
+                    Ok(Err(e)) => Some(Err(e)),
+                    Err(e) => Some(Err(format!("Task join error: {}", e))),
+                }
+            } else {
+                None
+            }
+        }
+    });
+
+    if let Some(Some(result)) = session_loader.read().as_ref() {
+        let current_sid = props.session_id.clone();
+        if current_sid != *loaded_session_id.read() {
+            match result {
                 Ok(session_data) => {
-                    if let ChatHistory::Collaborative(history) = session_data.history {
+                    if let ChatHistory::Collaborative(history) = &session_data.history {
+                        loaded_session_id.set(current_sid.clone());
                         selected_models.set(history.selected_models.clone());
-                        // Convert history rounds to internal format
-                        let converted_rounds: Vec<CollaborativeRound> = history.rounds
-                            .into_iter()
+                        let converted_rounds: Vec<CollaborativeRound> = history
+                            .rounds
+                            .iter()
                             .map(|r| {
-                                // Convert chat_history::ModelResponse to internal ModelResponse
-                                let phase1_responses: Vec<ModelResponse> = r.model_responses
-                                    .into_iter()
+                                let phase1_responses: Vec<ModelResponse> = r
+                                    .model_responses
+                                    .iter()
                                     .map(|mr| ModelResponse {
-                                        model_id: mr.model_id,
-                                        content: mr.content,
-                                        error_message: mr.error_message,
+                                        model_id: mr.model_id.clone(),
+                                        content: mr.content.clone(),
+                                        error_message: mr.error_message.clone(),
                                     })
                                     .collect();
-                                // For now, we'll reconstruct from the simplified history format
-                                // The history only stores final consensus, so we'll mark as complete
                                 CollaborativeRound {
-                                    user_question: r.user_message,
+                                    user_question: r.user_message.clone(),
                                     phase1_responses,
-                                    phase2_reviews: vec![], // Not stored in simplified format
+                                    phase2_reviews: vec![],
                                     phase3_consensus: r.final_consensus.as_ref().map(|consensus| ModelResponse {
                                         model_id: "consensus".to_string(),
                                         content: consensus.clone(),
@@ -195,20 +213,21 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load session {}: {}", sid, e);
+                    eprintln!("Failed to load session: {}", e);
+                    loaded_session_id.set(current_sid);
                     selected_models.set(Vec::new());
                     conversation_history.set(Vec::new());
                     prompt_templates.set(PromptTemplates::default());
                     selection_step.set(0);
                 }
             }
-        } else {
-            // New session - reset state
-            selected_models.set(Vec::new());
-            conversation_history.set(Vec::new());
-            prompt_templates.set(PromptTemplates::default());
-            selection_step.set(0);
         }
+    } else if props.session_id.is_none() && loaded_session_id.read().is_some() {
+        loaded_session_id.set(None);
+        selected_models.set(Vec::new());
+        conversation_history.set(Vec::new());
+        prompt_templates.set(PromptTemplates::default());
+        selection_step.set(0);
     }
 
     // Fetch models on component mount
@@ -252,9 +271,43 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
         templates.set(*editing_prompt_type.read(), new_prompt);
     };
 
+    let active_run_for_session = find_run_for_session(active_runs, &props.session_id, ChatMode::Collaborative);
+    let run_is_active = active_run_for_session.as_ref().is_some_and(|run| {
+        matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+    });
+    let cancel_bar_run = active_run_for_session.as_ref().and_then(|run| {
+        if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+            Some((run.id.clone(), matches!(run.status, RunStatus::Cancelling)))
+        } else {
+            None
+        }
+    });
+    if let Some(active_run) = &active_run_for_session {
+        if current_run_id.read().as_ref() != Some(&active_run.id) {
+            current_run_id.set(Some(active_run.id.clone()));
+        }
+    } else if current_run_id.read().is_some() {
+        current_run_id.set(None);
+    }
+
+    // Cancel active run when component unmounts
+    {
+        let mut active_runs = active_runs.clone();
+        let current_run_id = current_run_id.clone();
+        use_drop(move || {
+            if let Some(run_id) = current_run_id.try_read().ok().and_then(|id| id.clone()) {
+                if let Some(run) = active_runs.try_read().ok().and_then(|runs| runs.get(&run_id).cloned()) {
+                    run.request_cancel();
+                    run.task.cancel();
+                }
+                remove_run(active_runs, &run_id);
+            }
+        });
+    }
+
     // Send message handler
     let send_message = move |text: String| {
-        if text.trim().is_empty() || *is_processing.read() {
+        if text.trim().is_empty() || *is_processing.read() || run_is_active {
             return;
         }
 
@@ -274,6 +327,9 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
             let session_id_for_save = props.session_id.clone();
             let on_session_saved = props.on_session_saved.clone();
             let selected_models_for_save = selected_models.read().clone();
+            let run_id = create_run_id(ChatMode::Collaborative, &props.session_id);
+            current_run_id.set(Some(run_id.clone()));
+            let cancel_flag = Arc::new(AtomicBool::new(false));
 
             // Initialize new round
             conversation_history_clone.write().push(CollaborativeRound {
@@ -284,10 +340,13 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                 current_phase: CollaborativePhase::Initial,
             });
 
-            spawn(async move {
-                is_processing_clone.set(true);
-                current_phase_clone.set(CollaborativePhase::Initial);
-                current_streaming_clone.write().clear();
+            let run_id_for_task = run_id.clone();
+            let mut active_runs_for_task = active_runs.clone();
+            let cancel_flag_for_task = cancel_flag.clone();
+            let task = spawn_forever(async move {
+                try_signal_set(&mut is_processing_clone, true);
+                try_signal_set(&mut current_phase_clone, CollaborativePhase::Initial);
+                let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
 
                 // ========================================================
                 // PHASE 1: Initial Responses (Parallel)
@@ -311,7 +370,10 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                         let mut last_update = std::time::Instant::now();
                         const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                        while let Some(event) = rx.recv().await {
+                        while let Some(event) = recv_multi_event_with_cancel(&mut rx, &cancel_flag_for_task).await {
+                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let model_id = event.model_id.clone();
 
                             match event.event {
@@ -321,32 +383,29 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                         .entry(model_id.clone())
                                         .and_modify(|s| s.push_str(&content))
                                         .or_insert(content);
-                                    
+
                                         // Throttle updates: only write to signal every 16ms
                                         if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                            // Flush only the active model to reduce cloning work.
                                             if let Some(accumulated) = content_buffer.get(&model_id) {
-                                                current_streaming_clone
-                                                    .write()
-                                                    .insert(model_id.clone(), accumulated.clone());
+                                                let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                    responses.insert(model_id.clone(), accumulated.clone());
+                                                });
                                             }
-                                            
                                             last_update = std::time::Instant::now();
                                         }
                                 }
                                 StreamEvent::Done => {
                                     // Flush any remaining buffered content before marking done
                                     if let Some(accumulated) = content_buffer.remove(&model_id) {
-                                        let mut responses = current_streaming_clone.write();
-                                        responses.insert(model_id.clone(), accumulated.clone());
-                                        drop(responses);
+                                        let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                            responses.insert(model_id.clone(), accumulated.clone());
+                                        });
                                     }
-                                    
-                                    let final_content = current_streaming_clone
-                                        .read()
-                                        .get(&model_id)
-                                        .cloned()
-                                        .unwrap_or_default();
+
+                                    let final_content = try_signal_read(&current_streaming_clone, |responses| {
+                                        responses.get(&model_id).cloned().unwrap_or_default()
+                                    })
+                                    .unwrap_or_default();
 
                                     phase1_results.insert(
                                         model_id.clone(),
@@ -363,6 +422,9 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                     }
                                 }
                                 StreamEvent::Error(e) => {
+                                    if e == "Cancelled" {
+                                        break;
+                                    }
                                     phase1_results.insert(
                                         model_id.clone(),
                                         ModelResponse {
@@ -376,24 +438,35 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                             }
                         }
 
-                        // Update conversation with Phase 1 results
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.phase1_responses = models
-                                .iter()
-                                .filter_map(|id| phase1_results.get(id).cloned())
-                                .collect();
+                        // Early exit if cancelled after Phase 1
+                        if cancel_flag_for_task.load(Ordering::SeqCst) {
+                            try_signal_set(&mut is_processing_clone, false);
+                            set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                            return;
                         }
 
-                        current_streaming_clone.write().clear();
+                        // Update conversation with Phase 1 results
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.phase1_responses = models
+                                    .iter()
+                                    .filter_map(|id| phase1_results.get(id).cloned())
+                                    .collect();
+                            }
+                        });
+
+                        let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
 
                         // ========================================================
                         // PHASE 2: Cross-Review (Sequential per model)
                         // ========================================================
 
-                        current_phase_clone.set(CollaborativePhase::Review);
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.current_phase = CollaborativePhase::Review;
-                        }
+                        try_signal_set(&mut current_phase_clone, CollaborativePhase::Review);
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.current_phase = CollaborativePhase::Review;
+                            }
+                        });
 
                         let successful_phase1: Vec<_> = phase1_results
                             .values()
@@ -424,23 +497,24 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                 match client.stream_chat_completion(model_id.clone(), review_messages).await {
                                     Ok(mut stream) => {
                                         let mut review_content = String::new();
-                                        
+
                                         // Throttle updates: only write to signal every 16ms
                                         let mut last_update = std::time::Instant::now();
                                         const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                                        while let Some(event) = stream.next().await {
+                                        while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_task).await {
+                                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                                break;
+                                            }
                                             match event {
                                                 StreamEvent::Content(content) => {
                                                     review_content.push_str(&content);
-                                                    
+
                                                     // Throttle updates: only write to signal every 16ms
                                                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                                        current_streaming_clone.write().insert(
-                                                            model_id.clone(),
-                                                            review_content.clone(),
-                                                        );
-                                                        
+                                                        let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                            responses.insert(model_id.clone(), review_content.clone());
+                                                        });
                                                         last_update = std::time::Instant::now();
                                                     }
                                                 }
@@ -453,6 +527,9 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                                     break;
                                                 }
                                                 StreamEvent::Error(e) => {
+                                                    if e == "Cancelled" {
+                                                        break;
+                                                    }
                                                     phase2_results.push(ModelResponse {
                                                         model_id: model_id.clone(),
                                                         content: String::new(),
@@ -471,23 +548,45 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                         });
                                     }
                                 }
+                                let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                    responses.remove(model_id);
+                                });
 
-                                current_streaming_clone.write().remove(model_id);
+                                // Early exit if cancelled during Phase 2
+                                if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+
+                            // Early exit if cancelled after Phase 2
+                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                    if let Some(last_round) = history.last_mut() {
+                                        last_round.phase2_reviews = phase2_results;
+                                    }
+                                });
+                                try_signal_set(&mut is_processing_clone, false);
+                                set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                                return;
                             }
 
                             // Update conversation with Phase 2 results
-                            if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                last_round.phase2_reviews = phase2_results;
-                            }
+                            let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                if let Some(last_round) = history.last_mut() {
+                                    last_round.phase2_reviews = phase2_results;
+                                }
+                            });
 
                             // ========================================================
                             // PHASE 3: Consensus Synthesis
                             // ========================================================
 
-                            current_phase_clone.set(CollaborativePhase::Consensus);
-                            if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                last_round.current_phase = CollaborativePhase::Consensus;
-                            }
+                            try_signal_set(&mut current_phase_clone, CollaborativePhase::Consensus);
+                            let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                if let Some(last_round) = history.last_mut() {
+                                    last_round.current_phase = CollaborativePhase::Consensus;
+                                }
+                            });
 
                             // Use first model as synthesizer
                             let synthesizer_id = &models[0];
@@ -498,16 +597,18 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                 .collect::<Vec<_>>()
                                 .join("\n\n");
 
-                            let reviews_text: String = if let Some(round) = conversation_history_clone.read().last() {
-                                round.phase2_reviews
-                                    .iter()
-                                    .filter(|r| r.error_message.is_none())
-                                    .map(|r| format!("{}: {}", r.model_id, r.content))
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n")
-                            } else {
-                                String::new()
-                            };
+                            let reviews_text: String = try_signal_read(&conversation_history_clone, |history| {
+                                history.last().map(|round| {
+                                    round.phase2_reviews
+                                        .iter()
+                                        .filter(|r| r.error_message.is_none())
+                                        .map(|r| format!("{}: {}", r.model_id, r.content))
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n")
+                                })
+                            })
+                            .flatten()
+                            .unwrap_or_default();
 
                             let consensus_prompt = templates.consensus
                                 .replace("{user_question}", &user_msg)
@@ -527,70 +628,86 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                     let mut last_update = std::time::Instant::now();
                                     const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                                    while let Some(event) = stream.next().await {
+                                    while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_task).await {
+                                        if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                            break;
+                                        }
                                         match event {
                                             StreamEvent::Content(content) => {
                                                 consensus_content.push_str(&content);
-                                                
+
                                                 // Throttle updates: only write to signal every 16ms
                                                 if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                                    current_streaming_clone.write().insert(
-                                                        "consensus".to_string(),
-                                                        consensus_content.clone(),
-                                                    );
-                                                    
+                                                    let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                        responses.insert(
+                                                            "consensus".to_string(),
+                                                            consensus_content.clone(),
+                                                        );
+                                                    });
                                                     last_update = std::time::Instant::now();
                                                 }
                                             }
                                             StreamEvent::Done => {
                                                 // Flush final content
-                                                current_streaming_clone.write().insert(
-                                                    "consensus".to_string(),
-                                                    consensus_content.clone(),
-                                                );
-                                                
-                                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                                    last_round.phase3_consensus = Some(ModelResponse {
-                                                        model_id: synthesizer_id.clone(),
-                                                        content: consensus_content,
-                                                        error_message: None,
-                                                    });
-                                                    last_round.current_phase = CollaborativePhase::Complete;
-                                                }
+                                                let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                    responses.insert(
+                                                        "consensus".to_string(),
+                                                        consensus_content.clone(),
+                                                    );
+                                                });
+
+                                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                                    if let Some(last_round) = history.last_mut() {
+                                                        last_round.phase3_consensus = Some(ModelResponse {
+                                                            model_id: synthesizer_id.clone(),
+                                                            content: consensus_content,
+                                                            error_message: None,
+                                                        });
+                                                        last_round.current_phase = CollaborativePhase::Complete;
+                                                    }
+                                                });
                                                 break;
                                             }
                                             StreamEvent::Error(e) => {
-                                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                                    last_round.phase3_consensus = Some(ModelResponse {
-                                                        model_id: synthesizer_id.clone(),
-                                                        content: String::new(),
-                                                        error_message: Some(e),
-                                                    });
+                                                if e == "Cancelled" {
+                                                    break;
                                                 }
+                                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                                    if let Some(last_round) = history.last_mut() {
+                                                        last_round.phase3_consensus = Some(ModelResponse {
+                                                            model_id: synthesizer_id.clone(),
+                                                            content: String::new(),
+                                                            error_message: Some(e),
+                                                        });
+                                                    }
+                                                });
                                                 break;
                                             }
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                        last_round.phase3_consensus = Some(ModelResponse {
-                                            model_id: synthesizer_id.clone(),
-                                            content: String::new(),
-                                            error_message: Some(e),
-                                        });
-                                    }
+                                    let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                        if let Some(last_round) = history.last_mut() {
+                                            last_round.phase3_consensus = Some(ModelResponse {
+                                                model_id: synthesizer_id.clone(),
+                                                content: String::new(),
+                                                error_message: Some(e),
+                                            });
+                                        }
+                                    });
                                 }
                             }
                         }
 
-                        current_streaming_clone.write().clear();
-                        current_phase_clone.set(CollaborativePhase::Complete);
-                        is_processing_clone.set(false);
+                        let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
+                        try_signal_set(&mut current_phase_clone, CollaborativePhase::Complete);
+                        try_signal_set(&mut is_processing_clone, false);
                         
                         // Auto-save only when there is content (spawn_blocking to avoid blocking async runtime)
                         if let Some(sid) = session_id_for_save {
-                            let history_rounds: Vec<crate::utils::CollaborativeRound> = conversation_history_clone.read()
+                            let history_rounds: Vec<crate::utils::CollaborativeRound> = try_signal_read(&conversation_history_clone, |history| history.clone())
+                                .unwrap_or_default()
                                 .iter()
                                 .map(|r| {
                                     let model_responses: Vec<crate::utils::ModelResponse> = r.phase1_responses.iter()
@@ -639,21 +756,24 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                     }
                     Err(e) => {
                         // Handle error
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.phase1_responses = models
-                                .iter()
-                                .map(|id| ModelResponse {
-                                    model_id: id.clone(),
-                                    content: String::new(),
-                                    error_message: Some(e.clone()),
-                                })
-                                .collect();
-                        }
-                        is_processing_clone.set(false);
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.phase1_responses = models
+                                    .iter()
+                                    .map(|id| ModelResponse {
+                                        model_id: id.clone(),
+                                        content: String::new(),
+                                        error_message: Some(e.clone()),
+                                    })
+                                    .collect();
+                            }
+                        });
+                        try_signal_set(&mut is_processing_clone, false);
                         
                         // Auto-save even on error (only when there is content; spawn_blocking to avoid blocking async runtime)
                         if let Some(sid) = session_id_for_save {
-                            let history_rounds: Vec<crate::utils::CollaborativeRound> = conversation_history_clone.read()
+                            let history_rounds: Vec<crate::utils::CollaborativeRound> = try_signal_read(&conversation_history_clone, |history| history.clone())
+                                .unwrap_or_default()
                                 .iter()
                                 .map(|r| {
                                     let model_responses: Vec<crate::utils::ModelResponse> = r.phase1_responses.iter()
@@ -701,7 +821,22 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                         }
                     }
                 }
+                if cancel_flag_for_task.load(Ordering::SeqCst) {
+                    set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                } else {
+                    remove_run(active_runs_for_task, &run_id_for_task);
+                }
             });
+
+            register_active_run(
+                active_runs,
+                run_id,
+                props.session_id.clone(),
+                ChatMode::Collaborative,
+                "Collaborative round".to_string(),
+                task,
+                cancel_flag,
+            );
         }
     };
 
@@ -1199,6 +1334,31 @@ pub fn Collaborative(props: CollaborativeProps) -> Element {
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                if let Some((active_run_id, is_cancelling)) = cancel_bar_run.clone() {
+                    div {
+                        class: "px-4 py-3 border-t border-[var(--color-base-300)] bg-[var(--color-base-100)] flex items-center justify-between gap-3",
+                        div {
+                            class: "text-sm text-[var(--color-base-content)]/70",
+                            if is_cancelling {
+                                "Cancelling active collaborative run..."
+                            } else {
+                                "This collaborative run is active in the background. You can cancel it manually."
+                            }
+                        }
+                        button {
+                            onclick: move |_| {
+                                if let Some(run) = active_runs.read().get(&active_run_id).cloned() {
+                                    run.request_cancel();
+                                    set_run_status(active_runs, &active_run_id, RunStatus::Cancelling);
+                                }
+                            },
+                            disabled: is_cancelling,
+                            class: "px-3 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-500/90 disabled:opacity-60 disabled:cursor-not-allowed",
+                            if is_cancelling { "Cancelling..." } else { "Cancel Run" }
                         }
                     }
                 }

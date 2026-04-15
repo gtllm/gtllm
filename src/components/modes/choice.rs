@@ -1,9 +1,18 @@
 use super::common::{ChatInput, FormattedText, Modal, ModelSelector, ModelResponseCard};
-use crate::utils::{ChatHistory, ChatMessage, ChatMode, ChatSession, InputSettings, OpenRouterClient, SessionData, StreamEvent, Theme};
+use crate::utils::{
+    create_run_id, find_run_for_session, next_stream_event_with_cancel,
+    recv_multi_event_with_cancel, register_active_run, remove_run, set_run_status,
+    try_signal_read, try_signal_set, try_signal_update, ActiveRunRecord, ChatHistory,
+    ChatMessage, ChatMode, ChatSession, InputSettings, OpenRouterClient, RunStatus, SessionData,
+    StreamEvent, Theme,
+};
 use dioxus::prelude::*;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 struct SystemPrompts {
@@ -292,6 +301,7 @@ pub fn Choice(props: ChoiceProps) -> Element {
     let client = props.client.clone();
     let client_for_send = props.client;
     let input_settings = props.input_settings;
+    let active_runs = use_context::<Signal<HashMap<String, ActiveRunRecord>>>();
     let _ = theme.read();
 
     // Model selection state
@@ -303,6 +313,7 @@ pub fn Choice(props: ChoiceProps) -> Element {
     let mut is_processing = use_signal(|| false);
     let mut current_streaming_responses = use_signal(|| HashMap::<String, String>::new());
     let mut current_phase = use_signal(|| ChoicePhase::Decision);
+    let mut current_run_id = use_signal(|| None::<String>);
     
     // System prompts
     let mut system_prompts = use_signal(SystemPrompts::default);
@@ -315,19 +326,33 @@ pub fn Choice(props: ChoiceProps) -> Element {
     
     // Load history if session_id changes (not on every render)
     let session_id = props.session_id.clone();
-    let should_load = session_id != *loaded_session_id.read();
-    
-    if should_load {
-        loaded_session_id.set(session_id.clone());
-        
-        if let Some(sid) = session_id.clone() {
-            match ChatHistory::load_session(&sid) {
+    let session_loader = use_resource(move || {
+        let session_id = session_id.clone();
+        async move {
+            if let Some(sid) = session_id {
+                let result = tokio::task::spawn_blocking(move || ChatHistory::load_session(&sid)).await;
+                match result {
+                    Ok(Ok(session_data)) => Some(Ok(session_data)),
+                    Ok(Err(e)) => Some(Err(e)),
+                    Err(e) => Some(Err(format!("Task join error: {}", e))),
+                }
+            } else {
+                None
+            }
+        }
+    });
+
+    if let Some(Some(result)) = session_loader.read().as_ref() {
+        let current_sid = props.session_id.clone();
+        if current_sid != *loaded_session_id.read() {
+            match result {
                 Ok(session_data) => {
-                    if let ChatHistory::LLMChoice(history) = session_data.history {
+                    if let ChatHistory::LLMChoice(history) = &session_data.history {
+                        loaded_session_id.set(current_sid.clone());
                         selected_models.set(history.selected_models.clone());
-                        // Convert history rounds to internal format
-                        let converted_rounds: Vec<ChoiceRound> = history.rounds
-                            .into_iter()
+                        let converted_rounds: Vec<ChoiceRound> = history
+                            .rounds
+                            .iter()
                             .map(|r| {
                                 let strategy = match r.decision.as_str() {
                                     "collaborate" => Some(Strategy::Collaborate),
@@ -335,12 +360,12 @@ pub fn Choice(props: ChoiceProps) -> Element {
                                     _ => None,
                                 };
                                 ChoiceRound {
-                                    user_question: r.user_message,
-                                    decisions: vec![], // Not stored in simplified format
+                                    user_question: r.user_message.clone(),
+                                    decisions: vec![],
                                     chosen_strategy: strategy,
-                                    collaborative_result: None, // Not stored in simplified format
-                                    competitive_result: None, // Not stored in simplified format
-                                    current_phase: ChoicePhase::Complete, // Assume complete when loading
+                                    collaborative_result: None,
+                                    competitive_result: None,
+                                    current_phase: ChoicePhase::Complete,
                                 }
                             })
                             .collect();
@@ -351,20 +376,21 @@ pub fn Choice(props: ChoiceProps) -> Element {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load session {}: {}", sid, e);
+                    eprintln!("Failed to load session: {}", e);
+                    loaded_session_id.set(current_sid);
                     selected_models.set(Vec::new());
                     conversation_history.set(Vec::new());
                     system_prompts.set(SystemPrompts::default());
                     selection_step.set(0);
                 }
             }
-        } else {
-            // New session - reset state
-            selected_models.set(Vec::new());
-            conversation_history.set(Vec::new());
-            system_prompts.set(SystemPrompts::default());
-            selection_step.set(0);
         }
+    } else if props.session_id.is_none() && loaded_session_id.read().is_some() {
+        loaded_session_id.set(None);
+        selected_models.set(Vec::new());
+        conversation_history.set(Vec::new());
+        system_prompts.set(SystemPrompts::default());
+        selection_step.set(0);
     }
 
     // Handle model selection
@@ -396,9 +422,38 @@ pub fn Choice(props: ChoiceProps) -> Element {
         prompt_editor_open.set(false);
     };
 
+    let active_run_for_session = find_run_for_session(active_runs, &props.session_id, ChatMode::LLMChoice);
+    let run_is_active = active_run_for_session.as_ref().is_some_and(|run| {
+        matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+    });
+    let cancel_bar_run = active_run_for_session.as_ref().and_then(|run| {
+        if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+            Some((run.id.clone(), matches!(run.status, RunStatus::Cancelling)))
+        } else {
+            None
+        }
+    });
+    if let Some(active_run) = &active_run_for_session {
+        if current_run_id.read().as_ref() != Some(&active_run.id) {
+            current_run_id.set(Some(active_run.id.clone()));
+        }
+    } else if current_run_id.read().is_some() {
+        current_run_id.set(None);
+    }
+
+    {
+        let mut active_runs = active_runs.clone();
+        let current_run_id = current_run_id.clone();
+        use_drop(move || {
+            if let Some(run_id) = current_run_id.try_read().ok().and_then(|id| id.clone()) {
+                remove_run(active_runs, &run_id);
+            }
+        });
+    }
+
     // Send message handler
     let send_message = move |text: String| {
-        if text.trim().is_empty() || *is_processing.read() {
+        if text.trim().is_empty() || *is_processing.read() || run_is_active {
             return;
         }
 
@@ -418,6 +473,9 @@ pub fn Choice(props: ChoiceProps) -> Element {
             let session_id_for_save = props.session_id.clone();
             let on_session_saved = props.on_session_saved.clone();
             let selected_models_for_save = selected_models.read().clone();
+            let run_id = create_run_id(ChatMode::LLMChoice, &props.session_id);
+            current_run_id.set(Some(run_id.clone()));
+            let cancel_flag = Arc::new(AtomicBool::new(false));
 
             // Initialize new round
             {
@@ -432,10 +490,13 @@ pub fn Choice(props: ChoiceProps) -> Element {
                 });
             } // Drop the write borrow before spawning
 
-            spawn(async move {
-                is_processing_clone.set(true);
-                current_phase_clone.set(ChoicePhase::Decision);
-                current_streaming_clone.write().clear();
+            let run_id_for_task = run_id.clone();
+            let mut active_runs_for_task = active_runs.clone();
+            let cancel_flag_for_task = cancel_flag.clone();
+            let task = spawn(async move {
+                try_signal_set(&mut is_processing_clone, true);
+                try_signal_set(&mut current_phase_clone, ChoicePhase::Decision);
+                let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
 
                 // ========================================================
                 // PHASE 1: Strategy Decision
@@ -467,7 +528,10 @@ pub fn Choice(props: ChoiceProps) -> Element {
                         let mut last_update = std::time::Instant::now();
                         const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                        while let Some(event) = rx.recv().await {
+                        while let Some(event) = recv_multi_event_with_cancel(&mut rx, &cancel_flag_for_task).await {
+                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                break;
+                            }
                             let model_id = event.model_id.clone();
 
                             match event.event {
@@ -477,32 +541,31 @@ pub fn Choice(props: ChoiceProps) -> Element {
                                         .entry(model_id.clone())
                                         .and_modify(|s| s.push_str(&content))
                                         .or_insert(content);
-                                    
+
                                     // Throttle updates: only write to signal every 16ms
                                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
                                         // Flush only the active model to reduce cloning work.
                                         if let Some(accumulated) = content_buffer.get(&model_id) {
-                                            current_streaming_clone
-                                                .write()
-                                                .insert(model_id.clone(), accumulated.clone());
+                                            let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                responses.insert(model_id.clone(), accumulated.clone());
+                                            });
                                         }
-                                        
+
                                         last_update = std::time::Instant::now();
                                     }
                                 }
                                 StreamEvent::Done => {
                                     // Flush final accumulated content
                                     if let Some(accumulated) = content_buffer.get(&model_id) {
-                                        let mut responses = current_streaming_clone.write();
-                                        responses.insert(model_id.clone(), accumulated.clone());
-                                        drop(responses);
+                                        let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                            responses.insert(model_id.clone(), accumulated.clone());
+                                        });
                                     }
-                                    
-                                    let final_content = current_streaming_clone
-                                        .read()
-                                        .get(&model_id)
-                                        .cloned()
-                                        .unwrap_or_default();
+
+                                    let final_content = try_signal_read(&current_streaming_clone, |responses| {
+                                        responses.get(&model_id).cloned().unwrap_or_default()
+                                    })
+                                    .unwrap_or_default();
 
                                     decision_responses.insert(model_id.clone(), final_content.clone());
                                     done_models.insert(model_id.clone());
@@ -512,6 +575,9 @@ pub fn Choice(props: ChoiceProps) -> Element {
                                     }
                                 }
                                 StreamEvent::Error(e) => {
+                                    if e == "Cancelled" {
+                                        break;
+                                    }
                                     decisions.push(ModelDecision {
                                         model_id: model_id.clone(),
                                         decision: None,
@@ -521,6 +587,13 @@ pub fn Choice(props: ChoiceProps) -> Element {
                                     done_models.insert(model_id);
                                 }
                             }
+                        }
+
+                        // Early exit if cancelled after decision phase
+                        if cancel_flag_for_task.load(Ordering::SeqCst) {
+                            try_signal_set(&mut is_processing_clone, false);
+                            set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                            return;
                         }
 
                         // Parse decisions
@@ -540,12 +613,14 @@ pub fn Choice(props: ChoiceProps) -> Element {
                         let chosen_strategy = determine_strategy(&decisions);
 
                         // Update round with decisions
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.decisions = decisions;
-                            last_round.chosen_strategy = Some(chosen_strategy.clone());
-                        }
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.decisions = decisions;
+                                last_round.chosen_strategy = Some(chosen_strategy.clone());
+                            }
+                        });
 
-                        current_streaming_clone.write().clear();
+                        let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
 
                         // ========================================================
                         // PHASE 2: Execute Chosen Strategy
@@ -553,10 +628,12 @@ pub fn Choice(props: ChoiceProps) -> Element {
 
                         match chosen_strategy {
                             Strategy::Collaborate => {
-                                current_phase_clone.set(ChoicePhase::Collaborative);
-                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                    last_round.current_phase = ChoicePhase::Collaborative;
-                                }
+                                try_signal_set(&mut current_phase_clone, ChoicePhase::Collaborative);
+                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                    if let Some(last_round) = history.last_mut() {
+                                        last_round.current_phase = ChoicePhase::Collaborative;
+                                    }
+                                });
 
                                 // Execute collaborative workflow
                                 execute_collaborative(
@@ -566,13 +643,16 @@ pub fn Choice(props: ChoiceProps) -> Element {
                                     &prompts.collaborative,
                                     current_streaming_clone,
                                     conversation_history_clone,
+                                    cancel_flag_for_task.clone(),
                                 ).await;
                             }
                             Strategy::Compete => {
-                                current_phase_clone.set(ChoicePhase::Competitive);
-                                if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                                    last_round.current_phase = ChoicePhase::Competitive;
-                                }
+                                try_signal_set(&mut current_phase_clone, ChoicePhase::Competitive);
+                                let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                                    if let Some(last_round) = history.last_mut() {
+                                        last_round.current_phase = ChoicePhase::Competitive;
+                                    }
+                                });
 
                                 // Execute competitive workflow
                                 execute_competitive(
@@ -586,15 +666,18 @@ pub fn Choice(props: ChoiceProps) -> Element {
                             }
                         }
 
-                        current_phase_clone.set(ChoicePhase::Complete);
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.current_phase = ChoicePhase::Complete;
-                        }
-                        is_processing_clone.set(false);
+                        try_signal_set(&mut current_phase_clone, ChoicePhase::Complete);
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.current_phase = ChoicePhase::Complete;
+                            }
+                        });
+                        try_signal_set(&mut is_processing_clone, false);
                         
                         // Auto-save only when there is content (spawn_blocking to avoid blocking async runtime)
                         if let Some(sid) = session_id_for_save {
-                            let history_rounds: Vec<crate::utils::LLMChoiceRound> = conversation_history_clone.read()
+                            let history_rounds: Vec<crate::utils::LLMChoiceRound> = try_signal_read(&conversation_history_clone, |history| history.clone())
+                                .unwrap_or_default()
                                 .iter()
                                 .map(|r| {
                                     let decision = match r.chosen_strategy {
@@ -645,22 +728,25 @@ pub fn Choice(props: ChoiceProps) -> Element {
                     }
                     Err(e) => {
                         // Handle error
-                        if let Some(last_round) = conversation_history_clone.write().last_mut() {
-                            last_round.decisions = models
-                                .iter()
-                                .map(|id| ModelDecision {
-                                    model_id: id.clone(),
-                                    decision: None,
-                                    reasoning: String::new(),
-                                    error_message: Some(e.clone()),
-                                })
-                                .collect();
-                        }
-                        is_processing_clone.set(false);
+                        let _ = try_signal_update(&mut conversation_history_clone, |history| {
+                            if let Some(last_round) = history.last_mut() {
+                                last_round.decisions = models
+                                    .iter()
+                                    .map(|id| ModelDecision {
+                                        model_id: id.clone(),
+                                        decision: None,
+                                        reasoning: String::new(),
+                                        error_message: Some(e.clone()),
+                                    })
+                                    .collect();
+                            }
+                        });
+                        try_signal_set(&mut is_processing_clone, false);
                         
                         // Auto-save even on error (only when there is content; spawn_blocking to avoid blocking async runtime)
                         if let Some(sid) = session_id_for_save {
-                            let history_rounds: Vec<crate::utils::LLMChoiceRound> = conversation_history_clone.read()
+                            let history_rounds: Vec<crate::utils::LLMChoiceRound> = try_signal_read(&conversation_history_clone, |history| history.clone())
+                                .unwrap_or_default()
                                 .iter()
                                 .map(|r| {
                                     let decision = match r.chosen_strategy {
@@ -710,7 +796,18 @@ pub fn Choice(props: ChoiceProps) -> Element {
                         }
                     }
                 }
+                remove_run(active_runs_for_task, &run_id_for_task);
             });
+
+            register_active_run(
+                active_runs,
+                run_id,
+                props.session_id.clone(),
+                ChatMode::LLMChoice,
+                "LLM choice round".to_string(),
+                task,
+                cancel_flag,
+            );
         }
     };
 
@@ -1192,6 +1289,34 @@ pub fn Choice(props: ChoiceProps) -> Element {
                     }
                 }
 
+                if let Some((active_run_id, is_cancelling)) = cancel_bar_run.clone() {
+                    div {
+                        class: "px-4 py-3 border-t border-[var(--color-base-300)] bg-[var(--color-base-100)] flex items-center justify-between gap-3",
+                        div {
+                            class: "text-sm text-[var(--color-base-content)]/70",
+                            if is_cancelling {
+                                "Cancelling active LLM choice run..."
+                            } else {
+                                "This LLM choice run is active in the background. You can cancel it manually."
+                            }
+                        }
+                        button {
+                            onclick: move |_| {
+                                if let Some(run) = active_runs.read().get(&active_run_id).cloned() {
+                                    run.request_cancel();
+                                    run.task.cancel();
+                                    set_run_status(active_runs, &active_run_id, RunStatus::Cancelling);
+                                    remove_run(active_runs, &active_run_id);
+                                    is_processing.set(false);
+                                }
+                            },
+                            disabled: is_cancelling,
+                            class: "px-3 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-500/90 disabled:opacity-60 disabled:cursor-not-allowed",
+                            if is_cancelling { "Cancelling..." } else { "Cancel Run" }
+                        }
+                    }
+                }
+
                 // Input area
                 ChatInput {
                     theme,
@@ -1314,6 +1439,7 @@ async fn execute_collaborative(
     system_prompt: &str,
     mut current_streaming: Signal<HashMap<String, String>>,
     mut conversation_history: Signal<Vec<ChoiceRound>>,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     // Phase 1: Initial Responses
     let initial_prompt = format!(
@@ -1350,9 +1476,9 @@ async fn execute_collaborative(
                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
                         // Flush only the active model to reduce cloning work.
                         if let Some(accumulated) = content_buffer.get(&model_id) {
-                            current_streaming
-                                .write()
-                                .insert(model_id.clone(), accumulated.clone());
+                            let _ = try_signal_update(&mut current_streaming, |responses| {
+                                responses.insert(model_id.clone(), accumulated.clone());
+                            });
                         }
                         
                         last_update = std::time::Instant::now();
@@ -1361,16 +1487,15 @@ async fn execute_collaborative(
                 StreamEvent::Done => {
                     // Flush final accumulated content
                     if let Some(accumulated) = content_buffer.get(&model_id) {
-                        let mut responses = current_streaming.write();
-                        responses.insert(model_id.clone(), accumulated.clone());
-                        drop(responses);
+                        let _ = try_signal_update(&mut current_streaming, |responses| {
+                            responses.insert(model_id.clone(), accumulated.clone());
+                        });
                     }
                     
-                    let final_content = current_streaming
-                        .read()
-                        .get(&model_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let final_content = try_signal_read(&current_streaming, |responses| {
+                        responses.get(&model_id).cloned().unwrap_or_default()
+                    })
+                    .unwrap_or_default();
 
                     phase1_results.insert(
                         model_id.clone(),
@@ -1401,7 +1526,7 @@ async fn execute_collaborative(
         }
     }
 
-    current_streaming.write().clear();
+    let _ = try_signal_update(&mut current_streaming, |responses| responses.clear());
 
     // Prepare Phase 1 responses (drop borrow quickly)
     let phase1_responses: Vec<ModelResponse> = {
@@ -1516,18 +1641,20 @@ async fn execute_collaborative(
     }
 
     // Update round with all results (get fresh borrow)
-    if let Some(last_round) = conversation_history.write().last_mut() {
-        last_round.collaborative_result = Some(CollaborativeRound {
-            user_question: user_msg.to_string(),
-            phase1_responses,
-            phase2_reviews,
-            phase3_consensus: Some(ModelResponse {
-                model_id: synthesizer_id.clone(),
-                content: consensus_content,
-                error_message: consensus_error,
-            }),
-        });
-    }
+    let _ = try_signal_update(&mut conversation_history, |history| {
+        if let Some(last_round) = history.last_mut() {
+            last_round.collaborative_result = Some(CollaborativeRound {
+                user_question: user_msg.to_string(),
+                phase1_responses,
+                phase2_reviews,
+                phase3_consensus: Some(ModelResponse {
+                    model_id: synthesizer_id.clone(),
+                    content: consensus_content,
+                    error_message: consensus_error,
+                }),
+            });
+        }
+    });
 }
 
 async fn execute_competitive(
@@ -1571,9 +1698,9 @@ async fn execute_competitive(
                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
                         // Flush only the active model to reduce cloning work.
                         if let Some(accumulated) = content_buffer.get(&model_id) {
-                            current_streaming
-                                .write()
-                                .insert(model_id.clone(), accumulated.clone());
+                            let _ = try_signal_update(&mut current_streaming, |responses| {
+                                responses.insert(model_id.clone(), accumulated.clone());
+                            });
                         }
                         
                         last_update = std::time::Instant::now();
@@ -1582,12 +1709,15 @@ async fn execute_competitive(
                 StreamEvent::Done => {
                     // Flush final accumulated content
                     if let Some(accumulated) = content_buffer.get(&model_id) {
-                        let mut responses = current_streaming.write();
-                        responses.insert(model_id.clone(), accumulated.clone());
-                        drop(responses);
+                        let _ = try_signal_update(&mut current_streaming, |responses| {
+                            responses.insert(model_id.clone(), accumulated.clone());
+                        });
                     }
                     
-                    let final_content = current_streaming.read().get(&model_id).cloned().unwrap_or_default();
+                    let final_content = try_signal_read(&current_streaming, |responses| {
+                        responses.get(&model_id).cloned().unwrap_or_default()
+                    })
+                    .unwrap_or_default();
                     phase1_results.insert(
                         model_id.clone(),
                         ModelProposal {
@@ -1596,7 +1726,9 @@ async fn execute_competitive(
                             error_message: None,
                         },
                     );
-                    current_streaming.write().remove(&model_id);
+                    let _ = try_signal_update(&mut current_streaming, |responses| {
+                        responses.remove(&model_id);
+                    });
                 }
                 StreamEvent::Error(error) => {
                     phase1_results.insert(
@@ -1607,13 +1739,15 @@ async fn execute_competitive(
                             error_message: Some(error),
                         },
                     );
-                    current_streaming.write().remove(&model_id);
+                    let _ = try_signal_update(&mut current_streaming, |responses| {
+                        responses.remove(&model_id);
+                    });
                 }
             }
         }
     }
 
-    current_streaming.write().clear();
+    let _ = try_signal_update(&mut current_streaming, |responses| responses.clear());
 
     // Phase 2: Voting
     let successful_proposals: Vec<&ModelProposal> = phase1_results
@@ -1681,17 +1815,19 @@ async fn execute_competitive(
         let (vote_tallies, winners) = compute_tallies(&phase2_votes, models);
 
         // Update round
-        if let Some(last_round) = conversation_history.write().last_mut() {
-            last_round.competitive_result = Some(CompetitiveRound {
-                user_question: user_msg.to_string(),
-                phase1_proposals: models
-                    .iter()
-                    .filter_map(|id| phase1_results.get(id).cloned())
-                    .collect(),
-                phase2_votes,
-                vote_tallies,
-                winners,
-            });
-        }
+        let _ = try_signal_update(&mut conversation_history, |history| {
+            if let Some(last_round) = history.last_mut() {
+                last_round.competitive_result = Some(CompetitiveRound {
+                    user_question: user_msg.to_string(),
+                    phase1_proposals: models
+                        .iter()
+                        .filter_map(|id| phase1_results.get(id).cloned())
+                        .collect(),
+                    phase2_votes,
+                    vote_tallies,
+                    winners,
+                });
+            }
+        });
     }
 }

@@ -1,9 +1,17 @@
 use super::common::{ChatInput, FormattedText, Modal, ModelSelector};
-use crate::utils::{ChatMessage, ChatHistory, ChatMode, ChatSession, InputSettings, OpenRouterClient, SessionData, StandardHistory, StreamEvent, Theme};
+use crate::utils::{
+    create_run_id, find_run_for_session, next_stream_event_with_cancel, register_active_run,
+    remove_run, set_run_status, try_signal_read, try_signal_set, try_signal_update,
+    ActiveRunRecord, ChatMessage, ChatHistory, ChatMode, ChatSession, InputSettings,
+    OpenRouterClient, RunStatus, SessionData, StandardHistory, StreamEvent, Theme,
+};
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 struct ModelResponse {
@@ -77,6 +85,7 @@ pub fn Standard(props: StandardProps) -> Element {
     let client = props.client.clone();
     let client_for_send = props.client;
     let input_settings = props.input_settings;
+    let active_runs = use_context::<Signal<HashMap<String, ActiveRunRecord>>>();
     let _ = theme.read();
     let mut selected_models = use_signal(|| Vec::<String>::new());
     let mut user_messages = use_signal(|| Vec::<String>::new());
@@ -89,6 +98,7 @@ pub fn Standard(props: StandardProps) -> Element {
     
     let mut current_streaming_responses = use_signal(|| HashMap::<String, StreamingResponse>::new());
     let mut is_streaming = use_signal(|| false);
+    let mut current_run_id = use_signal(|| None::<String>);
     
     // System prompt state
     let mut system_prompt = use_signal(|| "You are a helpful AI assistant.".to_string());
@@ -210,9 +220,28 @@ pub fn Standard(props: StandardProps) -> Element {
         system_prompt_editor_open.set(false);
     };
 
+    let active_run_for_session = find_run_for_session(active_runs, &props.session_id, ChatMode::Standard);
+    let run_is_active = active_run_for_session.as_ref().is_some_and(|run| {
+        matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+    });
+    let cancel_bar_run = active_run_for_session.as_ref().and_then(|run| {
+        if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+            Some((run.id.clone(), matches!(run.status, RunStatus::Cancelling)))
+        } else {
+            None
+        }
+    });
+    if let Some(active_run) = &active_run_for_session {
+        if current_run_id.read().as_ref() != Some(&active_run.id) {
+            current_run_id.set(Some(active_run.id.clone()));
+        }
+    } else if current_run_id.read().is_some() {
+        current_run_id.set(None);
+    }
+
     // Handle sending a message
     let send_message = move |text: String| {
-        if text.trim().is_empty() || *is_streaming.read() {
+        if text.trim().is_empty() || *is_streaming.read() || run_is_active {
             return;
         }
 
@@ -238,10 +267,18 @@ pub fn Standard(props: StandardProps) -> Element {
             let user_messages_save = user_messages.clone();
             let selected_models_save = selected_models.clone();
             let system_prompt_save = system_prompt.clone();
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let run_id = create_run_id(ChatMode::Standard, &props.session_id);
+            current_run_id.set(Some(run_id.clone()));
 
-            spawn(async move {
-                is_streaming_clone.set(true);
-                current_streaming_responses_clone.write().clear();
+            let run_id_for_task = run_id.clone();
+            let mut active_runs_for_task = active_runs.clone();
+            let cancel_flag_for_task = cancel_flag.clone();
+            let task = spawn_forever(async move {
+                try_signal_set(&mut is_streaming_clone, true);
+                let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                    responses.clear()
+                });
 
                 // For single model, use its history directly
                 // For multiple models, we need to stream each separately with their own history
@@ -252,14 +289,17 @@ pub fn Standard(props: StandardProps) -> Element {
                 
                 if is_single_model {
                     // Single model with shared history
-                    let history = conversation_history_clone.read();
+                    let history = try_signal_read(&conversation_history_clone, |history| history.clone())
+                        .unwrap_or(ConversationHistory {
+                            single_model: Vec::new(),
+                            multi_model: HashMap::new(),
+                        });
                     let mut messages = vec![ChatMessage::system(sys_prompt.clone())];
                     for (user_msg, assistant_msg) in &history.single_model {
                         messages.push(ChatMessage::user(user_msg.clone()));
                         messages.push(ChatMessage::assistant(assistant_msg.clone()));
                     }
                     messages.push(ChatMessage::user(text.clone()));
-                    drop(history);
                     
                     let model_id = models[0].clone();
                     let request_sent_at = std::time::Instant::now();
@@ -280,7 +320,7 @@ pub fn Standard(props: StandardProps) -> Element {
                             let mut last_update = std::time::Instant::now();
                             const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
                             
-                            while let Some(event) = stream.next().await {
+                            while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_task).await {
                                 match event {
                                     StreamEvent::Content(chunk) => {
                                         // Track first token
@@ -293,10 +333,11 @@ pub fn Standard(props: StandardProps) -> Element {
                                         
                                     // Throttle UI updates to reduce re-render churn.
                                         if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                            let mut responses = current_streaming_responses_clone.write();
-                                            responses.insert(model_id.clone(), StreamingResponse {
-                                                content: content.clone(),
-                                                metrics: metrics.clone(),
+                                            let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                                responses.insert(model_id.clone(), StreamingResponse {
+                                                    content: content.clone(),
+                                                    metrics: metrics.clone(),
+                                                });
                                             });
                                             last_update = std::time::Instant::now();
                                         }
@@ -307,12 +348,17 @@ pub fn Standard(props: StandardProps) -> Element {
                                         break;
                                     }
                                     StreamEvent::Error(e) => {
+                                        if e == "Cancelled" {
+                                            break;
+                                        }
                                         metrics.completed_at = Some(std::time::Instant::now());
                                         let error_msg = format!("Error: {}", e);
                                         // Immediately show error in streaming UI
-                                        current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                            content: error_msg.clone(),
-                                            metrics: metrics.clone(),
+                                        let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                            responses.insert(model_id.clone(), StreamingResponse {
+                                                content: error_msg.clone(),
+                                                metrics: metrics.clone(),
+                                            });
                                         });
                                         final_results.insert(model_id.clone(), (String::new(), Some(e), Some(metrics)));
                                         break;
@@ -328,9 +374,11 @@ pub fn Standard(props: StandardProps) -> Element {
                             };
                             let error_msg = format!("Error: {}", e);
                             // Immediately show error in streaming UI
-                            current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                content: error_msg.clone(),
-                                metrics: metrics.clone(),
+                            let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                responses.insert(model_id.clone(), StreamingResponse {
+                                    content: error_msg.clone(),
+                                    metrics: metrics.clone(),
+                                });
                             });
                             final_results.insert(model_id, (String::new(), Some(e), Some(metrics)));
                         }
@@ -352,12 +400,17 @@ pub fn Standard(props: StandardProps) -> Element {
                         let conversation_history_clone = conversation_history_clone.clone();
                         let mut current_streaming_responses_clone = current_streaming_responses_clone.clone();
                         let shared_results = shared_results.clone();
+                        let cancel_flag_for_model = cancel_flag_for_task.clone();
                         
                         let future = async move {
                             let request_sent_at = std::time::Instant::now();
                             let mut first_token_received = false;
                             
-                            let history = conversation_history_clone.read();
+                            let history = try_signal_read(&conversation_history_clone, |history| history.clone())
+                                .unwrap_or(ConversationHistory {
+                                    single_model: Vec::new(),
+                                    multi_model: HashMap::new(),
+                                });
                             let mut messages = vec![ChatMessage::system(sys_prompt)];
                             if let Some(model_history) = history.multi_model.get(&model_id) {
                                 for (user_msg, assistant_msg) in model_history {
@@ -366,7 +419,6 @@ pub fn Standard(props: StandardProps) -> Element {
                                 }
                             }
                             messages.push(ChatMessage::user(text));
-                            drop(history);
                             
                             match client.stream_chat_completion(model_id.clone(), messages).await {
                                 Ok(mut stream) => {
@@ -383,7 +435,7 @@ pub fn Standard(props: StandardProps) -> Element {
                                     let mut last_update = std::time::Instant::now();
                                     const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
                                     
-                                    while let Some(event) = stream.next().await {
+                                    while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_model).await {
                                         match event {
                                             StreamEvent::Content(chunk) => {
                                                 // Track first token
@@ -396,9 +448,11 @@ pub fn Standard(props: StandardProps) -> Element {
                                                 
                                     // Throttle UI updates to reduce re-render churn.
                                                 if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                                    current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                                        content: content.clone(),
-                                                        metrics: metrics.clone(),
+                                                    let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                                        responses.insert(model_id.clone(), StreamingResponse {
+                                                            content: content.clone(),
+                                                            metrics: metrics.clone(),
+                                                        });
                                                     });
                                                     last_update = std::time::Instant::now();
                                                 }
@@ -406,20 +460,27 @@ pub fn Standard(props: StandardProps) -> Element {
                                             StreamEvent::Done => {
                                                 metrics.completed_at = Some(std::time::Instant::now());
                                                 // Flush final content
-                                                current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                                    content: content.clone(),
-                                                    metrics: metrics.clone(),
+                                                let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                                    responses.insert(model_id.clone(), StreamingResponse {
+                                                        content: content.clone(),
+                                                        metrics: metrics.clone(),
+                                                    });
                                                 });
                                                 shared_results.lock().await.insert(model_id.clone(), (content, None, Some(metrics)));
                                                 break;
                                             }
                                             StreamEvent::Error(e) => {
+                                                if e == "Cancelled" {
+                                                    break;
+                                                }
                                                 metrics.completed_at = Some(std::time::Instant::now());
                                                 let error_msg = format!("Error: {}", e);
                                                 // Immediately show error in streaming UI
-                                                current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                                    content: error_msg.clone(),
-                                                    metrics: metrics.clone(),
+                                                let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                                    responses.insert(model_id.clone(), StreamingResponse {
+                                                        content: error_msg.clone(),
+                                                        metrics: metrics.clone(),
+                                                    });
                                                 });
                                                 shared_results.lock().await.insert(model_id.clone(), (String::new(), Some(e), Some(metrics)));
                                                 break;
@@ -435,9 +496,11 @@ pub fn Standard(props: StandardProps) -> Element {
                                     };
                                     let error_msg = format!("Error: {}", e);
                                     // Immediately show error in streaming UI
-                                    current_streaming_responses_clone.write().insert(model_id.clone(), StreamingResponse {
-                                        content: error_msg.clone(),
-                                        metrics: metrics.clone(),
+                                    let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                                        responses.insert(model_id.clone(), StreamingResponse {
+                                            content: error_msg.clone(),
+                                            metrics: metrics.clone(),
+                                        });
                                     });
                                     shared_results.lock().await.insert(model_id.clone(), (String::new(), Some(e), Some(metrics)));
                                 }
@@ -474,8 +537,7 @@ pub fn Standard(props: StandardProps) -> Element {
                     .collect();
                 
                 // Update conversation history
-                {
-                    let mut history = conversation_history_clone.write();
+                let _ = try_signal_update(&mut conversation_history_clone, |history| {
                     if is_single_model {
                         if let Some(response) = final_responses.first() {
                             if response.error_message.is_none() {
@@ -491,17 +553,24 @@ pub fn Standard(props: StandardProps) -> Element {
                             }
                         }
                     }
-                }
+                });
                 
-                model_responses_clone.write().push(final_responses);
-                current_streaming_responses_clone.write().clear();
-                is_streaming_clone.set(false);
+                let _ = try_signal_update(&mut model_responses_clone, |responses| {
+                    responses.push(final_responses)
+                });
+                let _ = try_signal_update(&mut current_streaming_responses_clone, |responses| {
+                    responses.clear()
+                });
+                try_signal_set(&mut is_streaming_clone, false);
                 
                 // Auto-save only when there is content (spawn_blocking + cloned signals for current state)
                 if let Some(sid) = session_id_for_save {
                     let history = StandardHistory {
-                        user_messages: user_messages_save.read().clone(),
-                        model_responses: model_responses_clone.read().iter()
+                        user_messages: try_signal_read(&user_messages_save, |messages| messages.clone())
+                            .unwrap_or_default(),
+                        model_responses: try_signal_read(&model_responses_clone, |responses| responses.clone())
+                            .unwrap_or_default()
+                            .iter()
                             .map(|responses| {
                                 responses.iter()
                                     .map(|r| crate::utils::ModelResponse {
@@ -512,11 +581,19 @@ pub fn Standard(props: StandardProps) -> Element {
                                     .collect()
                             })
                             .collect(),
-                        selected_models: selected_models_save.read().clone(),
-                        system_prompt: system_prompt_save.read().clone(),
+                        selected_models: try_signal_read(&selected_models_save, |models| models.clone())
+                            .unwrap_or_default(),
+                        system_prompt: try_signal_read(&system_prompt_save, |prompt| prompt.clone())
+                            .unwrap_or_default(),
                         conversation_history: crate::utils::ConversationHistory {
-                            single_model: conversation_history_clone.read().single_model.clone(),
-                            multi_model: conversation_history_clone.read().multi_model.clone(),
+                            single_model: try_signal_read(&conversation_history_clone, |history| {
+                                history.single_model.clone()
+                            })
+                            .unwrap_or_default(),
+                            multi_model: try_signal_read(&conversation_history_clone, |history| {
+                                history.multi_model.clone()
+                            })
+                            .unwrap_or_default(),
                         },
                     };
                     let history_enum = ChatHistory::Standard(history.clone());
@@ -543,7 +620,22 @@ pub fn Standard(props: StandardProps) -> Element {
                         Ok(Ok(_)) => on_session_saved.call(session),
                     }
                 }
+                if cancel_flag_for_task.load(Ordering::SeqCst) {
+                    set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                } else {
+                    remove_run(active_runs_for_task, &run_id_for_task);
+                }
             });
+
+            register_active_run(
+                active_runs,
+                run_id,
+                props.session_id.clone(),
+                ChatMode::Standard,
+                "Standard response".to_string(),
+                task,
+                cancel_flag,
+            );
         }
     };
 
@@ -979,6 +1071,35 @@ pub fn Standard(props: StandardProps) -> Element {
                             }
                         }
                     }
+                }
+
+                if let Some((active_run_id, is_cancelling)) = cancel_bar_run.clone() {
+                        div {
+                            class: "px-4 py-3 border-t border-[var(--color-base-300)] bg-[var(--color-base-100)] flex items-center justify-between gap-3",
+                            div {
+                                class: "text-sm text-[var(--color-base-content)]/70",
+                                if is_cancelling {
+                                    "Cancelling active response..."
+                                } else {
+                                    "A response is running in the background. You can leave this chat open or cancel it manually."
+                                }
+                            }
+                            button {
+                                onclick: move |_| {
+                                    if let Some(run) = active_runs.read().get(&active_run_id).cloned() {
+                                        run.request_cancel();
+                                        set_run_status(active_runs, &active_run_id, RunStatus::Cancelling);
+                                    }
+                                },
+                                disabled: is_cancelling,
+                                class: "px-3 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-500/90 disabled:opacity-60 disabled:cursor-not-allowed",
+                                if is_cancelling {
+                                    "Cancelling..."
+                                } else {
+                                    "Cancel Run"
+                                }
+                            }
+                        }
                 }
 
                 // Input area

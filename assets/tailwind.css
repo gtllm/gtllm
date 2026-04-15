@@ -772,6 +772,9 @@
   .bg-purple-500 {
     background-color: var(--color-purple-500);
   }
+  .bg-red-500 {
+    background-color: var(--color-red-500);
+  }
   .bg-red-500\/10 {
     background-color: color-mix(in srgb, oklch(63.7% 0.237 25.331) 10%, transparent);
     @supports (color: color-mix(in lab, red, red)) {
@@ -1228,6 +1231,16 @@
       }
     }
   }
+  .hover\:bg-red-500\/90 {
+    &:hover {
+      @media (hover: hover) {
+        background-color: color-mix(in srgb, oklch(63.7% 0.237 25.331) 90%, transparent);
+        @supports (color: color-mix(in lab, red, red)) {
+          background-color: color-mix(in oklab, var(--color-red-500) 90%, transparent);
+        }
+      }
+    }
+  }
   .hover\:text-\[var\(--color-base-content\)\] {
     &:hover {
       @media (hover: hover) {
@@ -1303,6 +1316,11 @@
   .disabled\:opacity-50 {
     &:disabled {
       opacity: 50%;
+    }
+  }
+  .disabled\:opacity-60 {
+    &:disabled {
+      opacity: 60%;
     }
   }
   .disabled\:hover\:bg-transparent {

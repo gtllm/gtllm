@@ -1,9 +1,18 @@
 use super::common::{ChatInput, FormattedText, ModelResponseCard, PhaseIndicator, PromptCard, PromptEditorModal, VoteDisplay, VoteTally, VoteTallyProps};
-use crate::utils::{ChatMessage, ChatHistory, ChatMode, ChatSession, CompetitiveHistory, InputSettings, Model, OpenRouterClient, SessionData, StreamEvent, Theme};
+use crate::utils::{
+    create_run_id, find_run_for_session, next_stream_event_with_cancel,
+    recv_multi_event_with_cancel, register_active_run, remove_run, set_run_status,
+    try_signal_read, try_signal_set, try_signal_update, ActiveRunRecord, ChatMessage,
+    ChatHistory, ChatMode, ChatSession, CompetitiveHistory, InputSettings, Model,
+    OpenRouterClient, RunStatus, SessionData, StreamEvent, Theme,
+};
+use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
-use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CompetitivePromptType {
@@ -219,6 +228,7 @@ fn compute_tallies(votes: &[ModelVote], model_ids: &[String]) -> (Vec<VoteTally>
 
 #[component]
 pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, input_settings: Signal<InputSettings>, session_id: Option<String>, on_session_saved: EventHandler<ChatSession>) -> Element {
+    let active_runs = use_context::<Signal<HashMap<String, ActiveRunRecord>>>();
     // State
     let mut selected_models = use_signal(|| Vec::<String>::new());
     let mut selection_step = use_signal(|| 0usize); // 0 = select models, 1 = chat
@@ -227,6 +237,7 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
     let mut current_streaming_responses = use_signal(|| HashMap::<String, String>::new());
     let mut current_phase = use_signal(|| CompetitivePhase::Proposal);
     let mut prompt_templates = use_signal(PromptTemplates::default);
+    let mut current_run_id = use_signal(|| None::<String>);
     
     // Prompt editor state
     let mut prompt_editor_open = use_signal(|| false);
@@ -238,82 +249,87 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
     
     // Load history if session_id changes (not on every render)
     let session_id_for_load = session_id.clone();
-    let should_load = session_id_for_load != *loaded_session_id.read();
-    
-    if should_load {
-        loaded_session_id.set(session_id_for_load.clone());
-        
-        if let Some(sid) = session_id_for_load.clone() {
-            match ChatHistory::load_session(&sid) {
+    let session_loader = use_resource(move || {
+        let session_id = session_id_for_load.clone();
+        async move {
+            if let Some(sid) = session_id {
+                let result = tokio::task::spawn_blocking(move || ChatHistory::load_session(&sid)).await;
+                match result {
+                    Ok(Ok(session_data)) => Some(Ok(session_data)),
+                    Ok(Err(e)) => Some(Err(e)),
+                    Err(e) => Some(Err(format!("Task join error: {}", e))),
+                }
+            } else {
+                None
+            }
+        }
+    });
+
+    if let Some(Some(result)) = session_loader.read().as_ref() {
+        let current_sid = session_id.clone();
+        if current_sid != *loaded_session_id.read() {
+            match result {
                 Ok(session_data) => {
-                    if let ChatHistory::Competitive(history) = session_data.history {
-                    let selected_models_clone = history.selected_models.clone();
-                    selected_models.set(selected_models_clone.clone());
-                    prompt_templates.set(PromptTemplates {
-                        proposal: history.prompt_templates.proposal,
-                        voting: history.prompt_templates.voting,
-                    });
-                    
-                    // Convert rounds from history to internal format
-                        let converted_rounds: Vec<CompetitiveRound> = history.rounds
-                            .into_iter()
+                    if let ChatHistory::Competitive(history) = &session_data.history {
+                        loaded_session_id.set(current_sid.clone());
+                        let selected_models_clone = history.selected_models.clone();
+                        selected_models.set(selected_models_clone.clone());
+                        prompt_templates.set(PromptTemplates {
+                            proposal: history.prompt_templates.proposal.clone(),
+                            voting: history.prompt_templates.voting.clone(),
+                        });
+                        let converted_rounds: Vec<CompetitiveRound> = history
+                            .rounds
+                            .iter()
                             .map(|r| CompetitiveRound {
-                                user_question: r.user_question,
-                                phase1_proposals: r.phase1_proposals.into_iter()
-                                    .map(|p| ModelProposal {
-                                        model_id: p.model_id,
-                                        content: p.content,
-                                        error_message: p.error_message,
-                                    })
-                                    .collect(),
-                                phase2_votes: r.phase2_votes.into_iter()
-                                    .map(|v| ModelVote {
-                                        voter_id: v.voter_id,
-                                        voted_for: v.voted_for,
-                                    raw_response: v.raw_response,
-                                    error_message: v.error_message,
-                                })
-                                .collect(),
-                            vote_tallies: r.vote_tallies.into_iter()
-                                .map(|t| VoteTally {
-                                    model_id: t.model_id,
+                                user_question: r.user_question.clone(),
+                                phase1_proposals: r.phase1_proposals.iter().map(|p| ModelProposal {
+                                    model_id: p.model_id.clone(),
+                                    content: p.content.clone(),
+                                    error_message: p.error_message.clone(),
+                                }).collect(),
+                                phase2_votes: r.phase2_votes.iter().map(|v| ModelVote {
+                                    voter_id: v.voter_id.clone(),
+                                    voted_for: v.voted_for.clone(),
+                                    raw_response: v.raw_response.clone(),
+                                    error_message: v.error_message.clone(),
+                                }).collect(),
+                                vote_tallies: r.vote_tallies.iter().map(|t| VoteTally {
+                                    model_id: t.model_id.clone(),
                                     vote_count: t.vote_count,
-                                    voters: t.voters,
-                                })
-                                .collect(),
-                                winners: r.winners,
+                                    voters: t.voters.clone(),
+                                }).collect(),
+                                winners: r.winners.clone(),
                                 current_phase: match r.current_phase.as_str() {
                                     "proposal" => CompetitivePhase::Proposal,
                                     "voting" => CompetitivePhase::Voting,
                                     "tallying" => CompetitivePhase::Tallying,
-                                    "complete" => CompetitivePhase::Complete,
                                     _ => CompetitivePhase::Complete,
                                 },
                             })
                             .collect();
                         conversation_history.set(converted_rounds);
-                        
-                        // If models are loaded, go to chat step
                         if !selected_models_clone.is_empty() {
                             selection_step.set(1);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to load session {}: {}", sid, e);
+                    eprintln!("Failed to load session: {}", e);
+                    loaded_session_id.set(current_sid);
                     selected_models.set(Vec::new());
                     conversation_history.set(Vec::new());
                     prompt_templates.set(PromptTemplates::default());
                     selection_step.set(0);
                 }
             }
-        } else {
-            // New session - reset state
-            selected_models.set(Vec::new());
-            conversation_history.set(Vec::new());
-            prompt_templates.set(PromptTemplates::default());
-            selection_step.set(0);
         }
+    } else if session_id.is_none() && loaded_session_id.read().is_some() {
+        loaded_session_id.set(None);
+        selected_models.set(Vec::new());
+        conversation_history.set(Vec::new());
+        prompt_templates.set(PromptTemplates::default());
+        selection_step.set(0);
     }
 
     // Search state for model selection
@@ -334,6 +350,40 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
         templates.set(*editing_prompt_type.read(), new_prompt);
     };
 
+    let active_run_for_session = find_run_for_session(active_runs, &session_id, ChatMode::Competitive);
+    let run_is_active = active_run_for_session.as_ref().is_some_and(|run| {
+        matches!(run.status, RunStatus::Running | RunStatus::Cancelling)
+    });
+    let cancel_bar_run = active_run_for_session.as_ref().and_then(|run| {
+        if matches!(run.status, RunStatus::Running | RunStatus::Cancelling) {
+            Some((run.id.clone(), matches!(run.status, RunStatus::Cancelling)))
+        } else {
+            None
+        }
+    });
+    if let Some(active_run) = &active_run_for_session {
+        if current_run_id.read().as_ref() != Some(&active_run.id) {
+            current_run_id.set(Some(active_run.id.clone()));
+        }
+    } else if current_run_id.read().is_some() {
+        current_run_id.set(None);
+    }
+
+    // Cancel active run when component unmounts
+    {
+        let mut active_runs = active_runs.clone();
+        let current_run_id = current_run_id.clone();
+        use_drop(move || {
+            if let Some(run_id) = current_run_id.try_read().ok().and_then(|id| id.clone()) {
+                if let Some(run) = active_runs.try_read().ok().and_then(|runs| runs.get(&run_id).cloned()) {
+                    run.request_cancel();
+                    run.task.cancel();
+                }
+                remove_run(active_runs, &run_id);
+            }
+        });
+    }
+
     // Fetch models on mount
     use_hook(|| {
         if let Some(client_arc) = &client {
@@ -350,7 +400,7 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
 
     // Handle message sending
     let mut send_message = move |user_msg: String| {
-        if user_msg.trim().is_empty() || *is_processing.read() {
+        if user_msg.trim().is_empty() || *is_processing.read() || run_is_active {
             return;
         }
 
@@ -373,8 +423,14 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
             let on_session_saved = on_session_saved.clone();
             let selected_models_for_save = selected_models.read().clone();
             let prompt_templates_for_save = prompt_templates.read().clone();
+            let run_id = create_run_id(ChatMode::Competitive, &session_id);
+            current_run_id.set(Some(run_id.clone()));
+            let cancel_flag = Arc::new(AtomicBool::new(false));
 
-            spawn(async move {
+            let run_id_for_task = run_id.clone();
+            let mut active_runs_for_task = active_runs.clone();
+            let cancel_flag_for_task = cancel_flag.clone();
+            let task = spawn_forever(async move {
             // Create new round
             let mut round = CompetitiveRound {
                 user_question: user_msg.clone(),
@@ -386,7 +442,7 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
             };
 
             // PHASE 1: Proposals (Parallel)
-            current_phase_clone.set(CompetitivePhase::Proposal);
+            try_signal_set(&mut current_phase_clone, CompetitivePhase::Proposal);
 
             let proposal_prompt = templates.proposal.replace("{user_question}", &user_msg);
             let messages = vec![
@@ -403,7 +459,10 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                     let mut last_update = std::time::Instant::now();
                     const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
 
-                    while let Some(event) = rx.recv().await {
+                    while let Some(event) = recv_multi_event_with_cancel(&mut rx, &cancel_flag_for_task).await {
+                        if cancel_flag_for_task.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let model_id = event.model_id.clone();
 
                         match event.event {
@@ -413,49 +472,66 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                                     .entry(model_id.clone())
                                     .and_modify(|s| s.push_str(&content))
                                     .or_insert(content);
-                                
+
                                     // Throttle updates: only write to signal every 16ms
                                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
                                         // Flush only the active model to reduce cloning work.
                                         if let Some(accumulated) = content_buffer.get(&model_id) {
-                                            current_streaming_clone
-                                                .write()
-                                                .insert(model_id.clone(), accumulated.clone());
+                                            let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                                responses.insert(model_id.clone(), accumulated.clone());
+                                            });
                                         }
-                                        
+
                                         last_update = std::time::Instant::now();
                                     }
                             }
-                            StreamEvent::Done => {
-                                // Flush any remaining buffered content before marking done
-                                if let Some(accumulated) = content_buffer.remove(&model_id) {
-                                    let mut responses = current_streaming_clone.write();
-                                    responses.insert(model_id.clone(), accumulated.clone());
-                                    drop(responses);
-                                }
-                                
-                                let final_content = current_streaming_clone.read().get(&model_id).cloned().unwrap_or_default();
+                                StreamEvent::Done => {
+                                    // Flush any remaining buffered content before marking done
+                                    if let Some(accumulated) = content_buffer.remove(&model_id) {
+                                        let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                            responses.insert(model_id.clone(), accumulated.clone());
+                                        });
+                                    }
+
+                                let final_content = try_signal_read(&current_streaming_clone, |responses| {
+                                    responses.get(&model_id).cloned().unwrap_or_default()
+                                })
+                                .unwrap_or_default();
                                 phase1_results.insert(model_id.clone(), ModelProposal {
                                     model_id: model_id.clone(),
                                     content: final_content,
                                     error_message: None,
                                 });
-                                current_streaming_clone.write().remove(&model_id);
+                                let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                    responses.remove(&model_id);
+                                });
                             }
                             StreamEvent::Error(error) => {
+                                if error == "Cancelled" {
+                                    break;
+                                }
                                 phase1_results.insert(model_id.clone(), ModelProposal {
                                     model_id: model_id.clone(),
                                     content: String::new(),
                                     error_message: Some(error),
                                 });
-                                current_streaming_clone.write().remove(&model_id);
+                                let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                    responses.remove(&model_id);
+                                });
                             }
                         }
+                    }
+
+                    // Early exit if cancelled after Phase 1
+                    if cancel_flag_for_task.load(Ordering::SeqCst) {
+                        try_signal_set(&mut is_processing_clone, false);
+                        set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                        return;
                     }
                 }
                 Err(e) => {
                     eprintln!("Error in Phase 1: {}", e);
-                    is_processing_clone.set(false);
+                    try_signal_set(&mut is_processing_clone, false);
                     return;
                 }
             }
@@ -476,13 +552,13 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
             if successful_proposals.len() < 2 {
                 eprintln!("Not enough successful proposals");
                 round.current_phase = CompetitivePhase::Complete;
-                conversation_history_clone.write().push(round);
-                is_processing_clone.set(false);
+                let _ = try_signal_update(&mut conversation_history_clone, |history| history.push(round));
+                try_signal_set(&mut is_processing_clone, false);
                 return;
             }
 
             // PHASE 2: Voting (Sequential)
-            current_phase_clone.set(CompetitivePhase::Voting);
+            try_signal_set(&mut current_phase_clone, CompetitivePhase::Voting);
             round.current_phase = CompetitivePhase::Voting;
 
             // Build all_proposals text
@@ -508,36 +584,39 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                     ChatMessage::system("You are in a competitive evaluation workflow. Follow the phase instructions exactly.".to_string()),
                     ChatMessage::user(voting_prompt),
                 ];
-
-                current_streaming_clone.write().clear();
+                let _ = try_signal_update(&mut current_streaming_clone, |responses| responses.clear());
 
                 match client.stream_chat_completion(model_id.clone(), messages).await {
-                    Ok(mut rx) => {
+                    Ok(mut stream) => {
                         let mut vote_response = String::new();
 
                         // Throttle updates: only write to signal every 16ms
                         let mut last_update = std::time::Instant::now();
                         const UPDATE_INTERVAL_MS: u64 = 50; // ~20fps
-                        
-                        while let Some(event) = rx.next().await {
+
+                        while let Some(event) = next_stream_event_with_cancel(&mut stream, &cancel_flag_for_task).await {
+                            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                                break;
+                            }
                             match event {
                                 StreamEvent::Content(content) => {
                                     vote_response.push_str(&content);
-                                    
+
                                     // Throttle updates: only write to signal every 16ms
                                     if last_update.elapsed().as_millis() >= UPDATE_INTERVAL_MS as u128 {
-                                        current_streaming_clone.write().insert(model_id.clone(), vote_response.clone());
-                                        
+                                        let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                            responses.insert(model_id.clone(), vote_response.clone());
+                                        });
+
                                         last_update = std::time::Instant::now();
                                     }
                                 }
                                 StreamEvent::Done => {
                                     // Flush final content and remove from streaming
-                                    {
-                                        let mut responses = current_streaming_clone.write();
+                                    let _ = try_signal_update(&mut current_streaming_clone, |responses| {
                                         responses.insert(model_id.clone(), vote_response.clone());
                                         responses.remove(model_id.as_str());
-                                    }
+                                    });
 
                                     let valid_model_ids: Vec<String> = successful_proposals.iter()
                                         .map(|p| p.model_id.clone())
@@ -553,7 +632,12 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                                     });
                                 }
                                 StreamEvent::Error(error) => {
-                                    current_streaming_clone.write().remove(model_id);
+                                    if error == "Cancelled" {
+                                        break;
+                                    }
+                                    let _ = try_signal_update(&mut current_streaming_clone, |responses| {
+                                        responses.remove(model_id);
+                                    });
 
                                     round.phase2_votes.push(ModelVote {
                                         voter_id: model_id.clone(),
@@ -575,10 +659,22 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                         });
                     }
                 }
+
+                // Early exit if cancelled during Phase 2
+                if cancel_flag_for_task.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+
+            // Early exit if cancelled after Phase 2
+            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                try_signal_set(&mut is_processing_clone, false);
+                set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+                return;
             }
 
             // PHASE 3: Tallying
-            current_phase_clone.set(CompetitivePhase::Tallying);
+            try_signal_set(&mut current_phase_clone, CompetitivePhase::Tallying);
             round.current_phase = CompetitivePhase::Tallying;
 
             let valid_model_ids: Vec<String> = successful_proposals.iter()
@@ -591,14 +687,16 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
 
             // Complete
             round.current_phase = CompetitivePhase::Complete;
-            current_phase_clone.set(CompetitivePhase::Complete);
-            conversation_history_clone.write().push(round);
-            is_processing_clone.set(false);
+            try_signal_set(&mut current_phase_clone, CompetitivePhase::Complete);
+            let _ = try_signal_update(&mut conversation_history_clone, |history| history.push(round));
+            try_signal_set(&mut is_processing_clone, false);
             
             // Auto-save only when there is content (spawn_blocking to avoid blocking async runtime)
             if let Some(sid) = session_id_for_save {
                 let history = CompetitiveHistory {
-                    rounds: conversation_history_clone.read().iter()
+                    rounds: try_signal_read(&conversation_history_clone, |history| history.clone())
+                        .unwrap_or_default()
+                        .iter()
                         .map(|r| crate::utils::CompetitiveRound {
                             user_question: r.user_question.clone(),
                             phase1_proposals: r.phase1_proposals.iter()
@@ -661,7 +759,22 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                     }
                 }
             }
+            if cancel_flag_for_task.load(Ordering::SeqCst) {
+                set_run_status(active_runs_for_task, &run_id_for_task, RunStatus::Cancelled);
+            } else {
+                remove_run(active_runs_for_task, &run_id_for_task);
+            }
             });
+
+            register_active_run(
+                active_runs,
+                run_id,
+                session_id.clone(),
+                ChatMode::Competitive,
+                "Competitive round".to_string(),
+                task,
+                cancel_flag,
+            );
         }
     };
 
@@ -1077,6 +1190,31 @@ pub fn Competitive(theme: Signal<Theme>, client: Option<Arc<OpenRouterClient>>, 
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                if let Some((active_run_id, is_cancelling)) = cancel_bar_run.clone() {
+                    div {
+                        class: "px-4 py-3 border-t border-[var(--color-base-300)] bg-[var(--color-base-100)] flex items-center justify-between gap-3",
+                        div {
+                            class: "text-sm text-[var(--color-base-content)]/70",
+                            if is_cancelling {
+                                "Cancelling active competitive run..."
+                            } else {
+                                "This competitive run is active in the background. You can cancel it manually."
+                            }
+                        }
+                        button {
+                            onclick: move |_| {
+                                if let Some(run) = active_runs.read().get(&active_run_id).cloned() {
+                                    run.request_cancel();
+                                    set_run_status(active_runs, &active_run_id, RunStatus::Cancelling);
+                                }
+                            },
+                            disabled: is_cancelling,
+                            class: "px-3 py-2 rounded-lg bg-red-500 text-white text-sm font-medium hover:bg-red-500/90 disabled:opacity-60 disabled:cursor-not-allowed",
+                            if is_cancelling { "Cancelling..." } else { "Cancel Run" }
                         }
                     }
                 }
